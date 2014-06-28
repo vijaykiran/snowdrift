@@ -86,7 +86,7 @@ License
     projectType LicenseProjectType
     options Textarea Maybe
     website Text 
---    image ByteString Maybe
+    image ByteString Maybe
 
 ProjectBlog
     time UTCTime

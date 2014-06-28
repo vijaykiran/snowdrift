@@ -10,7 +10,7 @@ licenseEntryForm _ = do
     (licenseProjectTypeRes, licenseProjectTypeView) <- mreq (selectFieldList getLicenseProjectTypes) (generateFieldSettings "ProjectType" [("class", "form-control"), ("placeholder", "Project Type")]) Nothing
     (licenseOptionsRes, licenseOptionsView) <- mopt textareaField (generateFieldSettings "Options" [("class", "form-control"), ("placeholder", "License Options")]) Nothing
     (licenseWebsiteRes, licenseWebsiteView) <- mreq textField (generateFieldSettings "Website" [("class", "form-control"), ("placeholder", "Web Link to Legal Text")]) Nothing
---     (licenseIconRes, licenseIconView) <- mopt textField (generateFieldSettings "UploadIcon" [("class", "form-control"), ("placeholder", "Future Icon Upload - Leave blank for now")]) Nothing
+    (licenseIconRes, licenseIconView) <- fileAFormOpt (generateFieldSettings "UploadIcon" [("class", "form-control")]) Nothing
 
     let licenseEntryRes = License
                         <$> licenseNameRes
@@ -18,7 +18,7 @@ licenseEntryForm _ = do
                         <*> licenseProjectTypeRes
                         <*> licenseOptionsRes
                         <*> licenseWebsiteRes
-                        -- <*> licenseIconRes
+                        <*> licenseIconRes
     let widget = toWidget $(widgetFile "license_entry")
     return (licenseEntryRes, widget)
 

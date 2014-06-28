@@ -40,5 +40,4 @@
                 <label>
                     Link to Legal Logo:
             <div .col-md-3>
-                <label>
-                    This feature currently unavailable.
+                ^{fvInput licenseIconView}

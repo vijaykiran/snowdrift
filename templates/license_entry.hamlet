@@ -1,9 +1,3 @@
-<H1 Align="center">
-    Snowdrift.coop - Admin Site
-<H3 Align="center">
-    License Entry Form
-
-<form .form-horizontal>
     <div .row>
         <div .form-group>
             <div .col-md-2>

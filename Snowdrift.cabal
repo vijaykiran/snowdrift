@@ -148,6 +148,7 @@ library
                  , data-default
                  , aeson
                  , conduit
+                 , conduit-extra
                  , monad-logger
                  , fast-logger
                  , time

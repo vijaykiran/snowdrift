@@ -5,6 +5,15 @@ import Import
 import Data.List as L
 import Data.Text as T
 
+data LicenseFormData = LicenseFormData {
+                        lfdName :: Text
+                        , lfdClassification :: LicenseClassificationType
+                        , lfdProjectType :: LicenseProjectType
+                        , lfdOptions :: Maybe Textarea
+                        , lfdWebsite :: Text
+                        , lfdImage :: Maybe FileInfo
+                        } 
+
 getLicenseClassificationLabel :: LicenseClassificationType -> Text
 getLicenseClassificationLabel lct = case lct of
                                      CopyLeft -> "CopyLeft"

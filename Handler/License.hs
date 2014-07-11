@@ -2,16 +2,16 @@ module Handler.License where
 
 import Import
 import Model.License
-import Data.Maybe
+--import Data.Maybe
 import Data.ByteString as S
 import Data.ByteString.Lazy as L
-import Control.Monad.Trans.Resource
-import Control.Monad.ST
+--import Control.Monad.Trans.Resource
+--import Control.Monad.ST
 import Data.Conduit
 import Data.Conduit.Binary
 
 licenseEntryForm :: Html -> MForm Handler (FormResult LicenseFormData, Widget)
-licenseEntryForm _ = do
+licenseEntryForm lefHtml = do
     (licenseNameRes, licenseNameView) <- mreq textField (generateFieldSettings "LicenseName" [("class", "form-control"), ("placeholder", "License Name")]) Nothing
     (licenseClassificationRes, licenseClassificationView) <- mreq (selectFieldList getLicenseClassificationTypes) (generateFieldSettings "Classification" [("class", "form-control"), ("placeholder", "License Classification")]) Nothing
     (licenseProjectTypeRes, licenseProjectTypeView) <- mreq (selectFieldList getLicenseProjectTypes) (generateFieldSettings "ProjectType" [("class", "form-control"), ("placeholder", "Project Type")]) Nothing
@@ -32,7 +32,7 @@ licenseEntryForm _ = do
 
 getLicenseEntryR :: Handler Html
 getLicenseEntryR = do
-    ((form, widget), enctype) <- runFormGet licenseEntryForm
+    ((_, widget), enctype) <- runFormGet licenseEntryForm
     defaultLayout $ do
         setTitle "License Entry | Snowdrift.coop"
         [whamlet|
@@ -52,7 +52,7 @@ extractImage (Just x) = fmap (Just . toStrict) ((fileSource x $$ sinkLbs) :: Han
 
 postLicenseEntryR :: Handler Html
 postLicenseEntryR = do
-    ((result, widget), enctype) <- runFormPost $ licenseEntryForm
+    ((result, widget), enctype) <- runFormPostNoToken $ licenseEntryForm
     case result of
         FormSuccess l -> do
             limage <- extractImage $ lfdImage l
@@ -82,7 +82,7 @@ postLicenseEntryR = do
                  <br>
                  <ul>
                     $forall message <- messages
-                         <li>message
+                         <li>#{message}
                  <br>
                 <form .form-horizontal method=POST action=@{LicenseEntryR} enctype=#{enctype}>
                     ^{widget}

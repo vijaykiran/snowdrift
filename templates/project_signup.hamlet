@@ -38,7 +38,7 @@
             <div .form-group>
                 <div .col-md-1>
                     <label>Location Project is legally based out of:
-                <div .col-md-6>
+                <div .col-md-5>
                     ^{fvInput projectLocationView}
                 <div .col-md-2 align="right">
                     <label>

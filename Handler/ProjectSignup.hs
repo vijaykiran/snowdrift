@@ -53,7 +53,10 @@ postProjectSignupR = do
     ((result, widget), enctype) <- runFormPost $ projectSignupForm 
     case result of
         FormSuccess project -> do
-          if ((count [ProjectSignupName ==. val (projectSignupName project) ||. ProjectName ==. val (projectSignupName project)]) > 0)
+          projectcheck <- select $ from $ \a -> do
+            where_ (a ^. ProjectSignupName ==. val (projectSignupName project) ||. ProjectName ==. val (projectSignupName project)
+            return count (a ^. ProjectSignupName)
+          if projectcheck > 0
             then defaultLayout $ do
                 setTitle "Project Signup Form: Submission Error! | Snowdrift.coop"
                 [whamlet|

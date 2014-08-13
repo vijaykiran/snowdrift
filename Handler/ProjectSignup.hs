@@ -53,9 +53,11 @@ postProjectSignupR = do
     ((result, widget), enctype) <- runFormPost $ projectSignupForm 
     case result of
         FormSuccess project -> do
-          projectcheck <- runDB $ select $ from $ \(a, p) -> do
+          -- good thought, but probably better done with an insertUnique
+          [ Value projectcheck :: Value Int64 ] <- runDB $ select $ from $ \(a, p) -> do
               where_ (a ^. ProjectSignupName ==. val (projectSignupName project) ||. p ^. ProjectName ==. val (projectSignupName project))
               return $ count (a ^. ProjectSignupName)
+
           if projectcheck > 0
               then defaultLayout $ do
                   setTitle "Project Signup Form: Submission Error! | Snowdrift.coop"

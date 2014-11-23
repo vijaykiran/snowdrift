@@ -9,74 +9,65 @@ module Application
 
 import Import
 import Settings
--- import Yesod.Auth
-import Yesod.Default.Config
-import Yesod.Default.Main
-import Yesod.Default.Handlers
-import Network.Wai.Middleware.RequestLogger
-    ( mkRequestLogger, outputFormat, OutputFormat (..), IPAddrSource (..), destination
-    )
-import qualified Network.Wai.Middleware.RequestLogger as RequestLogger
-import qualified Database.Persist
--- import Database.Persist.Sql (runSqlPool)
-import Network.HTTP.Client.Conduit (newManager)
-import Control.Monad.Logger (runLoggingT, runStderrLoggingT)
-import Control.Concurrent (forkIO, threadDelay)
-import System.Log.FastLogger (newStdoutLoggerSet, defaultBufSize, flushLogStr)
-import Network.Wai.Logger (clockDateCacher)
-import Data.Default (def)
-import Yesod.Core.Types (loggerSet, Logger (Logger))
-
-import Control.Monad.Trans.Resource
-
-import System.Directory
-import Database.Persist.Postgresql (pgConnStr, withPostgresqlConn)
-
-import qualified Data.List as L
-import Data.Text as T
-import qualified Data.Text.IO as T
-
+import SnowdriftEventHandler
 import Version
+
+import           Control.Concurrent                   (forkIO, threadDelay)
+import           Control.Concurrent.STM               (atomically, newTChanIO, tryReadTChan)
+import           Control.Monad.Logger                 (runLoggingT, runStderrLoggingT)
+import           Control.Monad.Reader
+import           Control.Monad.Trans.Resource
+import           Data.ByteString                      (ByteString)
+import           Data.Default                         (def)
+import qualified Data.List                            as L
+import           Data.Text                            as T
+import qualified Data.Text.IO                         as T
+import qualified Database.Persist
+import           Database.Persist.Postgresql          (pgConnStr, withPostgresqlConn)
+import           Network.HTTP.Client.Conduit          (newManager)
+import           Network.Wai.Middleware.RequestLogger ( mkRequestLogger, outputFormat, OutputFormat (..)
+                                                      , IPAddrSource (..), destination
+                                                      )
+import           Network.Wai.Logger                   (clockDateCacher)
+import qualified Network.Wai.Middleware.RequestLogger as RequestLogger
+import           System.Directory
+import           System.Environment                   (lookupEnv)
+import           System.Log.FastLogger                (newStdoutLoggerSet, defaultBufSize, flushLogStr)
+import           System.Posix.Env.ByteString
+import           Yesod.Core.Types                     (loggerSet, Logger (Logger))
+import           Yesod.Default.Config
+import           Yesod.Default.Handlers
+import           Yesod.Default.Main
 
 -- Import all relevant handler modules here.
 -- Don't forget to add new modules to your cabal file!
-import Handler.Home
-import Handler.User
-import Handler.Widget
-import Handler.Project
-import Handler.Invitation
-import Handler.Invite
-import Handler.UpdateShares
-import Handler.Volunteer
-import Handler.Contact
-import Handler.Who
-import Handler.PostLogin
-import Handler.ToU
-import Handler.Privacy
-import Handler.Messages
-import Handler.Application
-import Handler.Applications
-import Handler.JsLicense
-import Handler.MarkdownTutorial
-import Handler.UserBalance
-import Handler.UserPledges
-import Handler.Wiki
-import Handler.Discussion
-import Handler.Tags
-import Handler.Tickets
-import Handler.RepoFeed
+
 import Handler.BuildFeed
-import Handler.ProjectSignup
+import Handler.Comment
+import Handler.Home
+import Handler.HonorPledge
+import Handler.Image
+import Handler.Invitation
+import Handler.JsLicense
 import Handler.License
+import Handler.MarkdownTutorial
+import Handler.Notification
+import Handler.PostLogin
+import Handler.Privacy
+import Handler.Project
+import Handler.ProjectSignup
+import Handler.RepoFeed
+import Handler.ResetPassword
+import Handler.ToU
+import Handler.User
+import Handler.User.Comment
+import Handler.Volunteer
+import Handler.Who
+import Handler.Widget
+import Handler.Wiki
+import Handler.Wiki.Comment
 
 import Widgets.Navbar
-
-import Data.ByteString (ByteString)
-import System.Posix.Env.ByteString
-
-import Control.Monad.Reader
-
-import System.Environment (lookupEnv)
 
 runSql :: MonadSqlPersist m => Text -> m ()
 runSql = flip rawExecute [] -- TODO quasiquoter?
@@ -140,22 +131,32 @@ makeFoundation conf = do
     -- used less than once a second on average, you may prefer to omit this
     -- thread and use "(updater >> getter)" in place of "getter" below.  That
     -- would update the cache every time it is used, instead of every second.
-    let updateLoop = do
+    let updateLoop = forever $ do
             threadDelay 1000000
             updater
             flushLogStr loggerSet'
             updateLoop
-    _ <- forkIO updateLoop
+    void $ forkIO updateLoop
 
+    event_chan <- newTChanIO
     let logger = Yesod.Core.Types.Logger loggerSet' getter
-        foundation = App navbar conf s p manager dbconf logger
+        foundation = App
+                       navbar
+                       conf
+                       s
+                       p
+                       manager
+                       dbconf
+                       logger
+                       event_chan
+                       snowdriftEventHandlers
 
     -- Perform database migration using our application's logging settings.
     case appEnv conf of
         Testing -> withEnv "PGDATABASE" "template1" (applyEnv $ persistConfig foundation) >>= \ dbconf' -> do
                 let runDBNoTransaction (SqlPersistT r) = runReaderT r
 
-                options <- maybe [] L.words <$> lookupEnv "SNOWDRIFT_TESTING_OPTIONS" 
+                options <- maybe [] L.words <$> lookupEnv "SNOWDRIFT_TESTING_OPTIONS"
 
                 unless (elem "nodrop" options) $ do
                     runStderrLoggingT $ runResourceT $ withPostgresqlConn (pgConnStr dbconf') $ runDBNoTransaction $ do
@@ -170,15 +171,18 @@ makeFoundation conf = do
         Database.Persist.runPool dbconf doMigration p
         runSqlPool migrateTriggers p
 
+
     runLoggingT
-	migration
-	(messageLoggerSource foundation logger)
+        migration
+        (messageLoggerSource foundation logger)
 
     now <- getCurrentTime
     let (base, diff) = version
     runLoggingT
         (runResourceT $ Database.Persist.runPool dbconf (insert_ $ Build now base diff) p)
         (messageLoggerSource foundation logger)
+
+    forkEventHandler foundation
 
     return foundation
 
@@ -218,20 +222,26 @@ doMigration = do
         runSql migration
 
     let new_last_migration = L.maximum $ migration_number : L.map fst migration_files
+
     update $ flip set [ DatabaseVersionLastMigration =. val new_last_migration ]
 
     migrations <- parseMigration' migrateAll
 
     let (unsafe, safe) = L.partition fst migrations
 
-    unless (L.null $ L.map snd safe) $ do
-        let filename = "migrations/migrate" <> show (new_last_migration + 1)
+    maybe_newer_last_migration <-
+        if (L.null $ L.map snd safe)
+         then return Nothing
+         else do
+            let filename = "migrations/migrate" <> show (new_last_migration + 1)
 
-        liftIO $ T.writeFile filename $ T.unlines $ L.map ((`snoc` ';') . snd) safe
+            liftIO $ T.writeFile filename $ T.unlines $ L.map ((`snoc` ';') . snd) safe
 
-        $(logWarn) $ "wrote " <> T.pack (show $ L.length safe) <> " safe statements to " <> T.pack filename
+            $(logWarn) $ "wrote " <> T.pack (show $ L.length safe) <> " safe statements to " <> T.pack filename
 
-        mapM_ (runSql . snd) migrations
+            mapM_ (runSql . snd) migrations
+
+            return $ Just $ new_last_migration + 1
 
     unless (L.null $ L.map snd unsafe) $ do
         let filename = "migrations/migrate.unsafe"
@@ -242,40 +252,7 @@ doMigration = do
 
         error "Some migration steps were unsafe.  Aborting."
 
-    rolloutStagingWikiPages
-
-
-rolloutStagingWikiPages :: (MonadBaseControl IO m, MonadIO m, MonadLogger m, MonadResource m, MonadThrow m) => SqlPersistT m ()
-rolloutStagingWikiPages = do
-    pages <- select $ from $ \ page -> do
-        where_ ( page ^. WikiPageTarget `like` val "_staging_%" )
-        return page
-
-    forM_ pages $ \ (Entity staged_page_id staged_page) -> do
-        let (Just target) = stripPrefix "_staging_" $ wikiPageTarget staged_page
-        [ Value page_id ] <- select $ from $ \ page -> do
-            where_ ( page ^. WikiPageTarget ==. val target )
-            return $ page ^. WikiPageId
-
-        update $ \ edit -> do
-            set edit [ WikiEditPage =. val page_id ]
-            where_ ( edit ^. WikiEditPage ==. val staged_page_id )
-
-        update $ \ page -> do
-            set page [ WikiPageContent =. val (wikiPageContent staged_page) ]
-            where_ ( page ^. WikiPageId ==. val page_id )
-
-        [ Value last_staged_edit_edit ] <- select $ from $ \ last_staged_edit -> do
-            where_ ( last_staged_edit ^. WikiLastEditPage ==. val staged_page_id )
-            return $ last_staged_edit ^. WikiLastEditEdit
-
-        update $ \ last_edit -> do
-            set last_edit [ WikiLastEditEdit =. val last_staged_edit_edit ]
-            where_ ( last_edit ^. WikiLastEditPage ==. val page_id )
-
-        delete $ from $ \ last_edit -> where_ ( last_edit ^. WikiLastEditPage ==. val staged_page_id )
-
-        delete $ from $ \ page -> where_ ( page ^. WikiPageId ==. val staged_page_id )
+    maybe (return ()) (\ newer_last_migration -> update $ flip set [ DatabaseVersionLastMigration =. val newer_last_migration ]) maybe_newer_last_migration
 
 
 migrateTriggers :: (MonadSqlPersist m, MonadBaseControl IO m, MonadThrow m) => m ()
@@ -284,10 +261,10 @@ migrateTriggers = runResourceT $ do
         [ "CREATE OR REPLACE FUNCTION log_role_event_trigger() RETURNS trigger AS $role_event$"
         , "    BEGIN"
         , "        IF (TG_OP = 'DELETE') THEN"
-        , "            INSERT INTO role_event (time, \"user\", role, project, added) SELECT now(), OLD.\"user\", OLD.role, OLD.project, 'f';"
+        , "            INSERT INTO role_event (ts, \"user\", role, project, added) SELECT now(), OLD.\"user\", OLD.role, OLD.project, 'f';"
         , "            RETURN OLD;"
         , "        ELSIF (TG_OP = 'INSERT') THEN"
-        , "            INSERT INTO role_event (time, \"user\", role, project, added) SELECT now(), NEW.\"user\", NEW.role, NEW.project, 't';"
+        , "            INSERT INTO role_event (ts, \"user\", role, project, added) SELECT now(), NEW.\"user\", NEW.role, NEW.project, 't';"
         , "            RETURN NEW;"
         , "        END IF;"
         , "        RETURN NULL;"
@@ -307,7 +284,7 @@ migrateTriggers = runResourceT $ do
         [ "CREATE OR REPLACE FUNCTION log_doc_event_trigger() RETURNS trigger AS $doc_event$"
         , "    BEGIN"
         , "        IF (TG_OP = 'INSERT' OR TG_OP = 'UPDATE') THEN"
-        , "            INSERT INTO doc_event (time, doc, blessed_version) SELECT now(), NEW.id, NEW.current_version;"
+        , "            INSERT INTO doc_event (ts, doc, blessed_version) SELECT now(), NEW.id, NEW.current_version;"
         , "            RETURN NEW;"
         , "        END IF;"
         , "        RETURN NULL;"
@@ -325,3 +302,18 @@ migrateTriggers = runResourceT $ do
 
     return ()
 
+--------------------------------------------------------------------------------
+-- SnowdriftEvent handling
+
+forkEventHandler :: App -> IO ()
+forkEventHandler app@App{..} = void . forkIO . forever $ do
+    threadDelay 1000000 -- Sleep for one second in between runs.
+    handleNEvents 10     -- Handle up to 10 events per run.
+  where
+    handleNEvents :: Int -> IO ()
+    handleNEvents 0 = return ()
+    handleNEvents n = atomically (tryReadTChan appEventChan) >>= \case
+        Nothing    -> return ()
+        Just event -> do
+            mapM_ (runDaemon app) (appEventHandlers settings <*> [event])
+            handleNEvents (n-1)

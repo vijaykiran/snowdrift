@@ -1,3 +1,6 @@
+<h1>
+    <div .text-center> Project Participants
+
 $forall Entity user_id user <- members
     <hr>
     <div .row>
@@ -9,10 +12,8 @@ $forall Entity user_id user <- members
                     <img .headshot src="#{avatar}">
                 $nothing
                     <img .headshot src="@{StaticR img_placeholder_png}">
-        <div .col-sm-9>
-            <p>
-                $maybe blurb <- userBlurb user
-                    ^{markdownWidget project_handle blurb}
-                $nothing
-                    &nbsp;
-
+        <div .blurb .col-sm-9>
+            $maybe blurb <- userBlurb user
+                ^{markdownWidgetWith (fixLinks project_handle discussion) blurb}
+            $nothing
+                &nbsp;

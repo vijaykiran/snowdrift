@@ -3,7 +3,6 @@ module Model.License where
 import Model.License.Internal
 import Import
 import Data.List as L
-import Data.Text as T
 
 data LicenseFormData = LicenseFormData {
                         lfdName :: Text

@@ -1,299 +1,367 @@
+-- | Handler for Wiki paths. Section comments are relative to /p/#handle/w
+
 module Handler.Wiki where
 
 import Import
 
-import Widgets.Markdown
-import Widgets.Time
-import Widgets.Preview
-
+import Handler.Comment
+import Handler.Discussion
+import Handler.Utils
+import Handler.Wiki.Comment (makeWikiPageCommentForestWidget, wikiDiscussionPage)
+import Model.Comment
+import Model.Comment.ActionPermissions
+import Model.Comment.Sql
+import Model.Discussion
+import Model.Markdown
+import Model.Notification
 import Model.Permission
 import Model.User
-import Model.ViewType
+import Model.Wiki
+import Widgets.Preview
+import Widgets.Time
+import View.Comment
+import View.Wiki
 
-import Model.WikiPage
+import           Data.Algorithm.Diff  (getDiff, Diff (..))
+import           Data.Default         (def)
+import qualified Data.Map             as M
+import qualified Data.Set             as S
+import qualified Data.Text            as T
+import           Text.Blaze.Html5     (ins, del, br)
+import           Text.Cassius         (cassiusFile)
+import           Yesod.Markdown
 
-import Yesod.Markdown
-import Model.Markdown
+import           Yesod.Default.Config            (appRoot)
 
-import qualified Data.Text as T
+--------------------------------------------------------------------------------
+-- Utility functions
 
-import qualified Data.Set as S
-import qualified Data.Map as M
+-- | Get the Project/WikiPage entities.
+pageInfo :: Text -> Language -> Text -> YDB (Entity Project, Entity WikiPage, Entity WikiTarget)
+pageInfo project_handle language target = do
+    project                           <- getBy404 $ UniqueProjectHandle project_handle
+    Entity wiki_target_id wiki_target <- getBy404 $ UniqueWikiTarget (entityKey project) language target
 
-import Data.Algorithm.Diff (getDiff, Diff (..))
+    let wiki_page_id = wikiTargetPage wiki_target
+    wiki_page                         <- get404 wiki_page_id
 
-import Text.Blaze.Html5 (ins, del, br)
+    return (project, Entity wiki_page_id wiki_page, Entity wiki_target_id wiki_target)
 
-getWikiR :: Text -> Text -> Handler Html
-getWikiR project_handle target = do
+-- | Get the Project/WikiPage entities, but require some generic permissions,
+-- failing with permissionDenied if they are not satisfied.
+pageInfoRequirePermission :: Text                                                          -- Project handle.
+                          -> Language
+                          -> Text                                                          -- Wiki page.
+                          -> (Entity User -> Entity Project -> Entity WikiPage -> DB Bool) -- Permission checker.
+                          -> Handler (Entity User, Entity Project, Entity WikiPage)
+pageInfoRequirePermission project_handle language target has_permission = do
+    user <- requireAuth
+    (project, page, ok) <- runYDB $ do
+        project     <- getBy404 $ UniqueProjectHandle project_handle
+        wiki_target <- getBy404 $ UniqueWikiTarget (entityKey project) language target
+
+        let wiki_page_id = wikiTargetPage $ entityVal wiki_target
+        wiki_page   <- get404 wiki_page_id
+
+        ok <- has_permission user project (Entity wiki_page_id wiki_page)
+        return (project, Entity wiki_page_id wiki_page, ok)
+    unless ok (permissionDenied "You don't have permission to access this page.")
+    return (user, project, page)
+
+-- | Like pageInfoRequirePermission, but specialized to requiring Project affiliation.
+pageInfoRequireAffiliation :: Text -> Language -> Text -> Handler (Entity User, Entity Project, Entity WikiPage)
+pageInfoRequireAffiliation project_handle language target =
+    pageInfoRequirePermission project_handle language target (\(Entity user_id _) (Entity project_id _) _ ->
+      userIsAffiliatedWithProjectDB user_id project_id)
+
+-- | Like pageInfoRequireAffiliation, but this is for creating a new WikiPage, so one doesn't
+-- already exist. TODO(mitchell): Make a better abstraction here.
+pageInfoRequireAffiliation' :: Text -> Handler (Entity User, Entity Project)
+pageInfoRequireAffiliation' project_handle = do
+    user@(Entity user_id _) <- requireAuth
+    (project, ok) <- runYDB $ do
+        project@(Entity project_id _) <- getBy (UniqueProjectHandle project_handle) >>= maybe (error $ "project hande not found: " ++ show project_handle) return
+        ok <- userIsAffiliatedWithProjectDB user_id project_id
+        return (project, ok)
+    unless ok (permissionDenied "You don't have permission to access this page.")
+    return (user, project)
+
+-- | Like pageInfoRequirePermission, but specialized to requiring that the User can edit a WikiPage.
+pageInfoRequireCanEdit :: Text -> Language -> Text -> Handler (Entity User, Entity Project, Entity WikiPage)
+pageInfoRequireCanEdit project_handle language target =
+    pageInfoRequirePermission project_handle language target (\(Entity _ user) _ _ -> return (userCanEditWikiPage user))
+
+--------------------------------------------------------------------------------
+-- /#language/#target
+
+getWikiR :: Text -> Language -> Text -> Handler Html
+getWikiR project_handle language target = do
     maybe_user <- maybeAuth
 
-    (Entity _ project, Entity _ page) <- getPageInfo project_handle target
+    languages <- getLanguages
 
-    moderator <- case maybe_user of
-        Nothing -> return False
-        Just (Entity viewer_id _) ->
-            runDB $ isProjectModerator project_handle viewer_id
+    (project, edit, comment_count) <- runYDB $ do
+        (Entity project_id project, Entity page_id page, _) <- pageInfo project_handle language target
 
-    [Value (comment_count :: Int)] <- runDB $ select $ from $ \comment -> do
-        where_ $ foldl1 (&&.) $ catMaybes
-            [ Just $ comment ^. CommentDiscussion ==. val (wikiPageDiscussion page)
-            , if moderator then Nothing else Just $ not_ $ isNothing $ comment ^. CommentModeratedTs
-            ]
-        return countRows
+        let muser_id      = entityKey <$> maybe_user
+            discussion_id = wikiPageDiscussion page
 
-    let can_edit = isJust $ userEstablishedTs =<< entityVal <$> maybe_user
+        case muser_id of
+            Nothing -> return ()
+            Just user_id -> do
+                is_watching <- userIsWatchingProjectDB user_id project_id
+                when is_watching $
+                    userViewWikiEditsDB user_id page_id
+
+        let has_permission = exprCommentProjectPermissionFilter muser_id (val project_id)
+
+        roots_ids    <- map entityKey <$> fetchDiscussionRootCommentsDB discussion_id has_permission
+        num_children <- length <$> fetchCommentsDescendantsDB roots_ids has_permission
+
+        edits <- select $ from $ \ (we `InnerJoin` le) -> do
+            on_ $ we ^. WikiEditId ==. le ^. WikiLastEditEdit
+            where_ $ we ^. WikiEditPage ==. val page_id
+            return we
+
+        let [Entity _ edit] = pickEditsByLanguage languages edits
+
+        return (project, edit, length roots_ids + num_children)
+
+    let can_edit = fromMaybe False (userCanEditWikiPage . entityVal <$> maybe_user)
 
     defaultLayout $ do
-
         setTitle . toHtml $
-            projectName project <> " : " <> wikiPageTarget page <> " | Snowdrift.coop"
+            projectName project <> " : " <> target <> " | Snowdrift.coop"
 
-        renderWiki comment_count project_handle target can_edit True page
+        renderWiki comment_count project_handle language target can_edit edit
 
-
-renderWiki :: Int -> Text -> Text -> Bool -> Bool -> WikiPage -> Widget
-renderWiki comment_count project_handle target can_edit can_view_meta page = $(widgetFile "wiki")
-
-
-getWikiPagesR :: Text -> Handler Html
-getWikiPagesR project_handle = do
-    (Entity _ project) <- runDB $ getBy404 $ UniqueProjectHandle project_handle
-    pages <- runDB $ select $ from $ \ (project' `InnerJoin` wiki_page) -> do
-        on_ $ project' ^. ProjectId ==. wiki_page ^. WikiPageProject
-        where_ $ project' ^. ProjectHandle ==. val project_handle
-        orderBy [asc $ wiki_page ^. WikiPageTarget]
-        return wiki_page
-
-    defaultLayout $ do
-        setTitle . toHtml $ projectName project <> " Wiki | Snowdrift.coop"
-        $(widgetFile "wiki_pages")
-
-
-postWikiR :: Text -> Text -> Handler Html
-postWikiR project_handle target = do
-    Entity user_id user <- requireAuth
+postWikiR :: Text -> Language -> Text -> Handler Html
+postWikiR project_handle target_language target = do
     now <- liftIO getCurrentTime
 
-    let can_edit = isJust $ userEstablishedTs user
-
-    unless can_edit $ permissionDenied "you do not have permission to edit this page"
-
-    (Entity project_id _, Entity page_id page) <- getPageInfo project_handle target
-
-    Entity _ last_edit <- runDB $ getBy404 $ UniqueWikiLastEdit page_id
-
-    ((result, _), _) <- runFormPost $ editWikiForm (wikiLastEditEdit last_edit) (wikiPageContent page) Nothing
+    (Entity user_id _, _, Entity page_id page) <- pageInfoRequireCanEdit project_handle target_language target
+    ((result, _), _) <- runFormPost $ editWikiForm undefined undefined Nothing
 
 
     case result of
-        FormSuccess (last_edit_id, content, comment) -> do
-            mode <- lookupPostParam "mode"
+        FormSuccess (prev_edit_id, content, comment) -> do
+            mode <- lookupPostMode
 
-            let action :: Text = "update"
+            WikiEdit { wikiEditLanguage = edit_language } <- runYDB $ get404 prev_edit_id
 
             case mode of
-                Just "preview" -> do
-                    (form, _) <- generateFormPost $ editWikiForm last_edit_id content (Just comment)
+                Just PostMode -> do
+                    runSYDB $ do
 
-                    defaultLayout $ renderPreview form action $
-                        renderWiki 0 project_handle target False False $
-                            WikiPage target project_id content (Key $ PersistInt64 (-1)) Normal
+                        [(Entity _ last_edit)] <- select $ from $ \ (we `InnerJoin` le) -> do
+                            on_ $ we ^. WikiEditId ==. le ^. WikiLastEditEdit
+                            where_ $ le ^. WikiLastEditPage ==. val page_id
+                                &&. le ^. WikiLastEditLanguage ==. val edit_language
 
-                Just x | x == action -> do
-                    runDB $ do
-                        update $ \ p -> do
-                            set p [WikiPageContent =. val content]
-                            where_ $ p ^. WikiPageId ==. val page_id
+                            return le
 
-                        edit_id <- insert $ WikiEdit now user_id page_id content (Just comment)
+                        new_edit_id <- createWikiEditDB user_id page_id edit_language content (Just comment)
+
                         -- TODO - I think there might be a race condition here...
-                        either_last_edit <- insertBy $ WikiLastEdit page_id edit_id
+                        either_last_edit <- lift $ insertBy $ WikiLastEdit page_id new_edit_id edit_language
 
-                        if last_edit_id == wikiLastEditEdit last_edit
-                         then lift $ addAlert "success" "Updated."
+                        if prev_edit_id == wikiLastEditEdit last_edit
+                         then lift $ lift $ alertSuccess "Updated."
                          else do
-                            [ Value last_editor ] <- select $ from $ \ edit -> do
-                                where_ $ edit ^. WikiEditId ==. val (wikiLastEditEdit last_edit)
-                                return $ edit ^. WikiEditUser
+                            [ Value last_editor ] <- lift $ select $ from $ \ we -> do
+                                where_ $ we ^. WikiEditId ==. val (wikiLastEditEdit last_edit)
+                                return $ we ^. WikiEditUser
 
-                            let comment_body = Markdown $ T.unlines
+                            render <- getUrlRender
+                            let wiki edit_id = render $ WikiEditR project_handle target_language target edit_id
+                                comment_body = Markdown $ T.unlines
                                     [ "ticket: edit conflict"
                                     , ""
-                                    , "[original version](" <> target <> "/h/" <> toPathPiece last_edit_id <> ")"
+                                    , "[original version](" <> wiki prev_edit_id <> ")"
                                     , ""
-                                    , "[my version](" <> target <> "/h/" <> toPathPiece edit_id <> ")"
+                                    , "[my version](" <> wiki new_edit_id <> ")"
                                     , ""
-                                    , "[their version](" <> target <> "/h/" <> toPathPiece (wikiLastEditEdit last_edit) <> ")"
+                                    , "[their version](" <> wiki (wikiLastEditEdit last_edit) <> ")"
                                     , ""
                                     , "(this ticket was automatically generated)"
                                     ]
 
-                            comment_id <- insert $ Comment now (Just now) (Just user_id) Nothing (wikiPageDiscussion page) Nothing user_id comment_body 0
 
-                            void $ insert $ Ticket now now "edit conflict" comment_id
+                            -- TODO LangEn here should be edit_language, once we actually translate the above
+                            comment_id <- lift $ insert =<< makeApprovedComment user_id (wikiPageDiscussion page) Nothing comment_body 0 VisPublic LangEn
 
-                            render <- lift getUrlRenderParams
-                            let message_text = Markdown $ T.unlines
+                            lift $ insert_ $ Ticket now now "edit conflict" comment_id
+
+                            let notif_text = Markdown $ T.unlines
                                     [ "Edit conflict for wiki page *" <> target <> "*."
-                                    , "<br>[**Ticket created**](" <> render (DiscussCommentR project_handle target comment_id) [] <> ")"
+                                    , "<br>[**Ticket created**](" <> render (WikiCommentR project_handle target_language target comment_id) <> ")"
                                     ]
 
-                            void $ insert $ Message (Just project_id) now (Just last_editor) (Just user_id) message_text True
-                            void $ insert $ Message (Just project_id) now (Just user_id) (Just last_editor) message_text True
+                            sendPreferredNotificationDB last_editor NotifEditConflict
+                                Nothing Nothing notif_text
+                            sendPreferredNotificationDB user_id NotifEditConflict
+                                Nothing Nothing notif_text
 
-                            lift $ addAlert "danger" "conflicting edits (ticket created, messages sent)"
+                            lift $ lift $ alertDanger "conflicting edits (ticket created, notification sent)"
 
                         case either_last_edit of
-                            Left (Entity to_update _) -> update $ \ l -> do
-                                set l [WikiLastEditEdit =. val edit_id]
+                            Left (Entity to_update _) -> lift $ update $ \ l -> do
+                                set l [WikiLastEditEdit =. val new_edit_id]
                                 where_ $ l ^. WikiLastEditId ==. val to_update
 
                             Right _ -> return ()
 
-                    redirect $ WikiR project_handle target
+                    redirect $ WikiR project_handle target_language target
 
-                _ -> error "Error: unrecognized mode"
+                _ -> do
+                    (form, _) <- generateFormPost $ editWikiForm prev_edit_id content (Just comment)
 
-
-        FormMissing -> error "Form missing."
-        FormFailure msgs -> error $ "Error submitting form: " ++ T.unpack (T.concat msgs)
-
-
-editWikiPermissionsForm :: PermissionLevel -> Form PermissionLevel
-editWikiPermissionsForm level = renderBootstrap3 $ areq permissionLevelField "Permission Level" (Just level)
-
-
-getEditWikiPermissionsR :: Text -> Text -> Handler Html
-getEditWikiPermissionsR project_handle target = do
-    Entity user_id user <- requireAuth
-    (Entity project_id project, Entity page_id page) <- getPageInfo project_handle target
-
-    affiliated <- runDB $ (||)
-            <$> isProjectAdmin project_handle user_id
-            <*> isProjectAdmin "snowdrift" user_id
-
-    unless affiliated $ permissionDenied "you do not have permission to edit page permissions"
-
-    (wiki_form, _) <- generateFormPost $ editWikiPermissionsForm (wikiPagePermissionLevel page)
-
-    defaultLayout $ do
-        setTitle . toHtml $ projectName project <> " Wiki Permissions - " <> target <> " | Snowdrift.coop"
-        $(widgetFile "edit_wiki_perm")
-
-
-postEditWikiPermissionsR :: Text -> Text -> Handler Html
-postEditWikiPermissionsR project_handle target = do
-    Entity user_id _ <- requireAuth
-    (_, Entity page_id page) <- getPageInfo project_handle target
-
-    affiliated <- runDB $ (||)
-            <$> isProjectAdmin project_handle user_id
-            <*> isProjectAdmin "snowdrift" user_id
-
-    unless affiliated $ permissionDenied "you do not have permission to edit page permissions"
-
-    ((result, _), _) <- runFormPost $ editWikiPermissionsForm (wikiPagePermissionLevel page)
-
-    case result of
-        FormSuccess level -> do
-            runDB $ update $ \ p -> do
-                where_ $ p ^. WikiPageId ==. val page_id
-                set p [ WikiPagePermissionLevel =. val level ]
-
-            addAlert "success" "permissions updated"
-
-            redirect $ WikiR project_handle target
+                    defaultLayout $ previewWidget form "update" $
+                        renderWiki 0 project_handle target_language target False $
+                            WikiEdit now user_id page_id edit_language content (Just comment)
 
         FormMissing -> error "Form missing."
         FormFailure msgs -> error $ "Error submitting form: " ++ T.unpack (T.concat msgs)
 
 
-getEditWikiR :: Text -> Text -> Handler Html
-getEditWikiR project_handle target = do
-    Entity user_id user <- requireAuth
-    (Entity project_id project, Entity page_id page) <- getPageInfo project_handle target
+--------------------------------------------------------------------------------
+-- /#language/#target/d
 
-    Entity _ last_edit <- runDB $ getBy404 $ UniqueWikiLastEdit page_id
+-- | getWikiDiscussionR generates the associated discussion page for each wiki page
+getWikiDiscussionR :: Text -> Language -> Text -> Handler Html
+getWikiDiscussionR project_handle language target = getDiscussion (getWikiDiscussionR' project_handle language target)
 
-    let can_edit = isJust $ userEstablishedTs user
+getWikiDiscussionR'
+        :: Text                                                      -- ^ Project handle.
+        -> Language
+        -> Text                                                      -- ^ Wiki page name.
+        -> (DiscussionId -> ExprCommentCond -> DB [Entity Comment])  -- ^ Root comment getter.
+        -> Handler Html
+getWikiDiscussionR' project_handle language target get_root_comments = do
+    muser <- maybeAuth
+    let muser_id = entityKey <$> muser
 
-    unless can_edit $ permissionDenied "you do not have permission to edit this page"
+    (Entity project_id project, root_comments) <- runYDB $ do
+        (project@(Entity project_id _), Entity _ page, _) <- pageInfo project_handle language target
+        let has_permission = (exprCommentProjectPermissionFilter muser_id (val project_id))
+        root_comments <- get_root_comments (wikiPageDiscussion page) has_permission
+        return (project, root_comments)
 
-    (wiki_form, _) <- generateFormPost $ editWikiForm (wikiLastEditEdit last_edit) (wikiPageContent page) Nothing
+    (comment_forest_no_css, _) <-
+        makeWikiPageCommentForestWidget
+            muser
+            project_id
+            project_handle
+            language
+            target
+            root_comments
+            def
+            getMaxDepth
+            False
+            mempty
+
+    let has_comments = not (null root_comments)
+        comment_forest = do
+            comment_forest_no_css
+            toWidget $(cassiusFile "templates/comment.cassius")
+
+    (comment_form, _) <- generateFormPost commentNewTopicForm
 
     defaultLayout $ do
-        setTitle . toHtml $ projectName project <> " Wiki - " <> wikiPageTarget page <> " | Snowdrift.coop"
+        setTitle . toHtml $ projectName project <> " Wiki Discussion - " <> target <> " | Snowdrift.coop"
+        $(widgetFile "wiki_discuss")
+
+--------------------------------------------------------------------------------
+-- /#language/#target/d/new
+
+getNewWikiDiscussionR :: Text -> Language -> Text -> Handler Html
+getNewWikiDiscussionR project_handle language target = do
+    void requireAuth
+    let widget = commentNewTopicFormWidget
+    defaultLayout $(widgetFile "wiki_discussion_wrapper")
+
+postNewWikiDiscussionR :: Text -> Language -> Text -> Handler Html
+postNewWikiDiscussionR project_handle language target = do
+    user <- requireAuth
+    (_, Entity _ WikiPage{..}, _) <- runYDB (pageInfo project_handle language target)
+
+    postNewComment
+      Nothing
+      user
+      wikiPageDiscussion
+      (makeProjectCommentActionPermissionsMap (Just user) project_handle def) >>= \case
+        Left comment_id -> redirect (WikiCommentR project_handle language target comment_id)
+        Right (widget, form) -> defaultLayout $ previewWidget form "post" (wikiDiscussionPage project_handle language target widget)
+
+--------------------------------------------------------------------------------
+-- /#language/#target/diff/#from/#to
+-- /#language/#target/diffp
+
+getWikiDiffR :: Text -> Language -> Text -> WikiEditId -> WikiEditId -> Handler Html
+getWikiDiffR project_handle language target start_edit_id end_edit_id = do
+    (Entity _ project, Entity page_id _, _) <- runYDB $ pageInfo project_handle language target
+
+    (start_edit, end_edit) <- runYDB $ (,)
+        <$> get404 start_edit_id
+        <*> get404 end_edit_id
+
+    when (page_id /= wikiEditPage start_edit) $ error "selected 'start' edit is not an edit of selected page"
+    when (page_id /= wikiEditPage end_edit)   $ error "selected 'end' edit is not an edit of selected page"
+
+    let diffEdits = getDiff `on` ((\ (Markdown text) -> T.lines text) . wikiEditContent)
+        renderDiff = mconcat . map (\ a -> (case a of Both x _ -> toHtml x; First x -> del (toHtml x); Second x -> ins (toHtml x)) >> br)
+
+    defaultLayout $ do
+        setTitle . toHtml $ projectName project <> " Wiki Diff - " <> target <> " | Snowdrift.coop"
+        $(widgetFile "wiki_diff")
+
+-- | A proxy handler that redirects "ugly" to "pretty" diff URLs,
+-- e.g. /w/diff?from=a&to=b to /w/diff/a/b
+getWikiDiffProxyR :: Text -> Language -> Text -> Handler Html
+getWikiDiffProxyR project_handle language target = do
+--    _ <- requireAuthId
+
+    (start_edit_id_t, end_edit_id_t) <- runInputGet $ (,)
+                                        <$> ireq textField "start"
+                                        <*> ireq textField "end"
+    let pairMay = do
+        s <- fromPathPiece start_edit_id_t
+        e <- fromPathPiece end_edit_id_t
+        return (s, e)
+    maybe
+        (invalidArgs ["revision IDs"])
+        (\(s, e) -> redirect $ WikiDiffR project_handle language target s e)
+        pairMay
+
+--------------------------------------------------------------------------------
+-- /#language/#target/edit
+
+getEditWikiR :: Text -> Language -> Text -> Handler Html
+getEditWikiR project_handle language target = do
+    (_, Entity _ project, Entity page_id _) <- pageInfoRequireCanEdit project_handle language target
+    (last_edit, edit) <- runYDB $ do
+        -- TODO - on missing version, redirect to translate
+        Entity _ last_edit <- getBy404 $ UniqueWikiLastEdit page_id language
+        edit <- get404 $ wikiLastEditEdit last_edit
+        return (last_edit, edit)
+
+    (wiki_form, _) <- generateFormPost $ editWikiForm (wikiLastEditEdit last_edit) (wikiEditContent edit) Nothing
+
+    defaultLayout $ do
+        setTitle . toHtml $ projectName project <> " Wiki - " <> target <> " | Snowdrift.coop"
         $(widgetFile "edit_wiki")
 
+--------------------------------------------------------------------------------
+-- /#language/#target/h
 
-getNewWikiR :: Text -> Text -> Handler Html
-getNewWikiR project_handle target = do
-    Entity user_id user <- requireAuth
-    Entity _ project <- runDB $ getBy404 $ UniqueProjectHandle project_handle
-    affiliated <- runDB $ (||)
-            <$> isProjectAffiliated project_handle user_id
-            <*> isProjectAdmin "snowdrift" user_id
-
-    unless affiliated $ permissionDenied "you do not have permission to edit this page"
-
-    (wiki_form, _) <- generateFormPost $ newWikiForm Nothing
-
-    defaultLayout $ do
-        setTitle . toHtml $ projectName project <> " Wiki - New Page | Snowdrift.coop"
-        $(widgetFile "new_wiki")
-
-
-postNewWikiR :: Text -> Text -> Handler Html
-postNewWikiR project_handle target = do
-    Entity user_id _ <- requireAuth
-
-    affiliated <- runDB $ (||)
-            <$> isProjectAffiliated project_handle user_id
-            <*> isProjectAdmin "snowdrift" user_id
-
-    unless affiliated $ permissionDenied "you do not have permission to edit this page"
-
-    now <- liftIO getCurrentTime
-
-    Entity project_id _ <- runDB $ getBy404 $ UniqueProjectHandle project_handle
-
-    ((result, _), _) <- runFormPost $ newWikiForm Nothing
-
-    case result of
-        FormSuccess content -> do
-            mode <- lookupPostParam "mode"
-            let action :: Text = "create"
-            case mode of
-                Just "preview" -> do
-                        (form, _) <- generateFormPost $ newWikiForm (Just content)
-                        defaultLayout $ renderPreview form action $ renderWiki 0 project_handle target False False page
-                            where page = WikiPage target project_id content (Key $ PersistInt64 0) Normal
-
-
-                Just x | x == action -> do
-                    _ <- runDB $ do
-                        discussion <- insert (Discussion 0)
-                        page_id <- insert $ WikiPage target project_id content discussion Normal
-                        edit_id <- insert $ WikiEdit now user_id page_id content $ Just "Page created."
-                        insert $ WikiLastEdit page_id edit_id
-
-                    addAlert "success" "Created."
-                    redirect $ WikiR project_handle target
-
-                _ -> error "unrecognized mode"
-
-        FormMissing -> error "Form missing."
-        FormFailure msgs -> error $ "Error submitting form: " ++ T.unpack (T.concat msgs)
-
-
-getWikiHistoryR :: Text -> Text -> Handler Html
-getWikiHistoryR project_handle target = do
-    --_ <- requireAuthId
-    (Entity project_id project, Entity page_id _) <- getPageInfo project_handle target
+getWikiHistoryR :: Text -> Language -> Text -> Handler Html
+getWikiHistoryR project_handle language target = do
+    (Entity _ project, Entity page_id _, _) <- runYDB $ pageInfo project_handle language target
 
     (edits, users) <- runDB $ do
-        edits <- select $ from $ \ edit -> do
+        edits <-
+            select $
+            from $ \ edit -> do
             where_ ( edit ^. WikiEditPage ==. val page_id )
             orderBy [ desc (edit ^. WikiEditId) ]
             return edit
@@ -311,47 +379,303 @@ getWikiHistoryR project_handle target = do
         setTitle . toHtml $ projectName project <> " Wiki History - " <> target <> " | Snowdrift.coop"
         $(widgetFile "wiki_history")
 
+--------------------------------------------------------------------------------
+-- /#language/#target/h/#edit
 
--- | A proxy handler that redirects "ugly" to "pretty" diff URLs,
--- e.g. /w/diff?from=a&to=b to /w/diff/a/b
-getWikiDiffProxyR :: Text -> Text -> Handler Html
-getWikiDiffProxyR project_handle target = do
---    _ <- requireAuthId
+getWikiEditR :: Text -> Language -> Text -> WikiEditId -> Handler Html
+getWikiEditR project_handle language target wiki_edit_id = do
+    (Entity _ project, Entity wiki_page_id _, wiki_target) <- runYDB $ pageInfo project_handle language target
+    wiki_edit <- runYDB $ do
+        wiki_edit <- get404 wiki_edit_id
 
-    (start_edit_id_t, end_edit_id_t) <- runInputGet $ (,)
-                                        <$> ireq textField "start"
-                                        <*> ireq textField "end"
-    let pairMay = do
-        s <- fromPathPiece start_edit_id_t
-        e <- fromPathPiece end_edit_id_t
-        return (s, e)
-    maybe
-        (invalidArgs ["revision IDs"])
-        (\(s, e) -> redirect $ WikiDiffR project_handle target s e)
-        pairMay
+        when (wiki_page_id /= wikiEditPage wiki_edit) $ error "selected edit is not an edit of selected page"
 
+        return wiki_edit
 
-getWikiDiffR :: Text -> Text -> WikiEditId -> WikiEditId -> Handler Html
-getWikiDiffR project_handle target start_edit_id end_edit_id = do
---    _ <- requireAuthId
-
-    (Entity project_id project, Entity page_id _) <- getPageInfo project_handle target
-
-    (start_edit, end_edit) <- runDB $ do
-        start_edit <- get404 start_edit_id
-        end_edit <- get404 end_edit_id
-
-        when (page_id /= wikiEditPage start_edit) $ error "selected 'start' edit is not an edit of selected page"
-        when (page_id /= wikiEditPage end_edit) $ error "selected 'end' edit is not an edit of selected page"
-
-        return (start_edit, end_edit)
-
-    let diffEdits = getDiff `on` ((\ (Markdown text) -> T.lines text) . wikiEditContent)
-        renderDiff = mconcat . map (\ a -> (case a of Both x _ -> toHtml x; First x -> del (toHtml x); Second x -> ins (toHtml x)) >> br)
+    let discussion = DiscussionOnWikiPage wiki_target
 
     defaultLayout $ do
-        setTitle . toHtml $ projectName project <> " Wiki Diff - " <> target <> " | Snowdrift.coop"
-        $(widgetFile "wiki_diff")
+    -- TODO: prettier date format? or edit id?
+        setTitle . toHtml $ projectName project <> " Wiki - " <> target <> " at " <> T.pack (show $ wikiEditTs wiki_edit) <> " | Snowdrift.coop"
+        $(widgetFile "wiki_edit")
+
+--------------------------------------------------------------------------------
+-- /#language/#target/new
+
+getNewWikiR :: Text -> Language -> Text -> Handler Html
+getNewWikiR project_handle language target = do
+    (_, Entity _ project) <- pageInfoRequireAffiliation' project_handle
+    (wiki_form, _) <- generateFormPost $ newWikiForm Nothing
+    defaultLayout $ do
+        setTitle . toHtml $ projectName project <> " Wiki - New Page | Snowdrift.coop"
+        $(widgetFile "new_wiki")
+
+
+postNewWikiR :: Text -> Language -> Text -> Handler Html
+postNewWikiR project_handle language target = do
+    (Entity user_id _, Entity project_id _) <- pageInfoRequireAffiliation' project_handle
+
+    now <- liftIO getCurrentTime
+    ((result, _), _) <- runFormPost $ newWikiForm Nothing
+    case result of
+        FormSuccess content -> do
+            lookupPostMode >>= \case
+                Just PostMode -> do
+                    runSDB (createWikiPageDB language target project_id content Normal user_id)
+
+                    alertSuccess "Created."
+                    redirect $ WikiR project_handle language target
+
+                _ -> do
+                    (form, _) <- generateFormPost $ newWikiForm (Just content)
+                    defaultLayout $ do
+                        let wiki_page_id = Key $ PersistInt64 (-1)
+                            edit = WikiEdit now user_id wiki_page_id language content (Just "page created")
+
+                        previewWidget form "create" $ renderWiki 0 project_handle language target False edit
+
+        FormMissing -> error "Form missing."
+        FormFailure msgs -> error $ "Error submitting form: " ++ T.unpack (T.concat msgs)
+
+--------------------------------------------------------------------------------
+-- /#language/#target/translate
+
+getNewWikiTranslationR :: Text -> Language -> Text -> Handler Html
+getNewWikiTranslationR project_handle language target = do
+    (_, Entity _ project, Entity page_id _) <- pageInfoRequireAffiliation project_handle language target
+
+    languages <- getLanguages
+
+    edits <- runYDB $ select $ from $ \ we -> do
+        where_ $ we ^. WikiEditPage ==. val page_id
+        return we
+
+    let (Entity edit_id edit:_) = pickEditsByLanguage languages edits
+
+
+    (translation_form, enctype) <- generateFormPost $ newWikiTranslationForm (Just edit_id) (Just $ wikiEditContent edit) Nothing Nothing Nothing
+    defaultLayout $ do
+        setTitle . toHtml $ projectName project <> " Wiki - New Translation | Snowdrift.coop"
+        $(widgetFile "new_wiki_translation")
+
+
+postNewWikiTranslationR :: Text -> Language -> Text -> Handler Html
+postNewWikiTranslationR project_handle language target = do
+    (Entity user_id _, Entity project_id _, Entity page_id _) <- pageInfoRequireAffiliation project_handle language target
+
+    now <- liftIO getCurrentTime
+    ((result, _), _) <- runFormPost $ newWikiTranslationForm Nothing Nothing Nothing Nothing Nothing
+    case result of
+        FormSuccess (edit_id, new_content, new_language, new_target, complete) -> do
+            lookupPostMode >>= \case
+                Just PostMode -> do
+                    runSDB $ createWikiTranslationDB page_id new_language new_target project_id new_content user_id [(edit_id, complete)]
+
+                    alertSuccess "Created."
+                    redirect $ WikiR project_handle new_language new_target
+
+                _ -> do
+                    (form, _) <- generateFormPost $ newWikiTranslationForm (Just edit_id) (Just new_content) (Just new_language) (Just new_target) (Just complete)
+                    defaultLayout $ do
+                        let wiki_page_id = Key $ PersistInt64 (-1)
+                            edit = WikiEdit now user_id wiki_page_id language new_content (Just "page created")
+
+                        previewWidget form "create" $ renderWiki 0 project_handle language target False edit
+
+        FormMissing -> error "Form missing."
+        FormFailure msgs -> error $ "Error submitting form: " ++ T.unpack (T.concat msgs)
+
+--------------------------------------------------------------------------------
+-- /#language/#target/perm
+
+getEditWikiPermissionsR :: Text -> Language -> Text -> Handler Html
+getEditWikiPermissionsR project_handle language target = do
+    (_, Entity _ project, Entity _ page) <- pageInfoRequireAffiliation project_handle language target
+    (wiki_form, _) <- generateFormPost $ editWikiPermissionsForm (wikiPagePermissionLevel page)
+
+    defaultLayout $ do
+        setTitle . toHtml $ projectName project <> " Wiki Permissions - " <> target <> " | Snowdrift.coop"
+        $(widgetFile "edit_wiki_perm")
+
+postEditWikiPermissionsR :: Text -> Language -> Text -> Handler Html
+postEditWikiPermissionsR project_handle language target = do
+    (_, _, Entity page_id page) <- pageInfoRequireAffiliation project_handle language target
+    ((result, _), _) <- runFormPost $ editWikiPermissionsForm (wikiPagePermissionLevel page)
+
+    case result of
+        FormSuccess level -> do
+            runDB $
+                update $ \ p -> do
+                where_ $ p ^. WikiPageId ==. val page_id
+                set p [ WikiPagePermissionLevel =. val level ]
+
+            alertSuccess "permissions updated"
+
+            redirect $ WikiR project_handle language target
+
+        FormMissing -> error "Form missing."
+        FormFailure msgs -> error $ "Error submitting form: " ++ T.unpack (T.concat msgs)
+
+--------------------------------------------------------------------------------
+-- DEPRECATED
+
+getMonolingualWikiR :: Text -> Text -> [Text] -> Handler Html
+getMonolingualWikiR = redirectPolylingualWiki $ \case
+    Nothing -> notFound
+    Just url@(MonolingualWikiR _ _ _) -> error $ "not found: " ++ show url
+
+    Just url@(WikiR _ _ _)                      -> redirectSameParams url
+    Just url@(WikiCommentR _ _ _ _)             -> redirectSameParams url
+    Just url@(NewWikiTranslationR _ _ _)        -> redirectSameParams url
+    Just url@(ClaimWikiCommentR _ _ _ _)        -> redirectSameParams url
+    Just url@(CloseWikiCommentR _ _ _ _)        -> redirectSameParams url
+    Just url@(DeleteWikiCommentR _ _ _ _)       -> redirectSameParams url
+    Just url@(EditWikiCommentR _ _ _ _)         -> redirectSameParams url
+    Just url@(FlagWikiCommentR _ _ _ _)         -> redirectSameParams url
+    Just url@(ApproveWikiCommentR _ _ _ _)      -> redirectSameParams url
+    Just url@(ReplyWikiCommentR _ _ _ _)        -> redirectSameParams url
+    Just url@(RethreadWikiCommentR _ _ _ _)     -> redirectSameParams url
+    Just url@(RetractWikiCommentR _ _ _ _)      -> redirectSameParams url
+    Just url@(WikiCommentAddTagR _ _ _ _)       -> redirectSameParams url
+    Just url@(WikiCommentTagsR _ _ _ _)         -> redirectSameParams url
+    Just url@(WikiCommentTagR _ _ _ _ _)        -> redirectSameParams url
+    Just url@(WikiCommentApplyTagR _ _ _ _)     -> redirectSameParams url
+    Just url@(WikiCommentCreateTagR _ _ _ _)    -> redirectSameParams url
+    Just url@(UnclaimWikiCommentR _ _ _ _)      -> redirectSameParams url
+    Just url@(WikiDiscussionR _ _ _)            -> redirectSameParams url
+    Just url@(NewWikiDiscussionR _ _ _)         -> redirectSameParams url
+    Just url@(WikiDiffR _ _ _ _ _)              -> redirectSameParams url
+    Just url@(WikiDiffProxyR _ _ _)             -> redirectSameParams url
+    Just url@(EditWikiR _ _ _)                  -> redirectSameParams url
+    Just url@(WikiHistoryR _ _ _)               -> redirectSameParams url
+    Just url@(WikiEditR _ _ _ _)                -> redirectSameParams url
+    Just url@(NewWikiR _ _ _)                   -> redirectSameParams url
+    Just url@(EditWikiPermissionsR _ _ _)       -> redirectSameParams url
+    Just url@(WatchWikiCommentR _ _ _ _)        -> redirectSameParams url
+    Just url@(UnwatchWikiCommentR _ _ _ _)      -> redirectSameParams url
+    Just url@(OldDiscussCommentR _ _ _ _)       -> redirectSameParams url
+    Just url@(OldWikiEditR _ _ _ _)             -> redirectSameParams url
+
+    -- These routes are higher in the tree - can't possibly have been generated by inserting the language
+    Just (StaticR _)                            -> error "the impossible happened"
+    Just (AuthR _)                              -> error "the impossible happened"
+    Just FaviconR                               -> error "the impossible happened"
+    Just RobotsR                                -> error "the impossible happened"
+    Just HomeR                                  -> error "the impossible happened"
+    Just PostLoginR                             -> error "the impossible happened"
+    Just HonorPledgeR                           -> error "the impossible happened"
+    Just JsLicenseR                             -> error "the impossible happened"
+    Just PrivacyR                               -> error "the impossible happened"
+    Just ResetPasswordR                         -> error "the impossible happened"
+    Just ToUR                                   -> error "the impossible happened"
+    Just MarkdownTutorialR                      -> error "the impossible happened"
+    Just UploadImageR                           -> error "the impossible happened"
+    Just (NameImageR _)                         -> error "the impossible happened"
+    Just (ImageR _)                             -> error "the impossible happened"
+    Just (ImageMetaR _)                         -> error "the impossible happened"
+    Just UsersR                                 -> error "the impossible happened"
+    Just UserCreateR                            -> error "the impossible happened"
+    Just (UserR _)                              -> error "the impossible happened"
+    Just (UserBalanceR _)                       -> error "the impossible happened"
+    Just (UserDiscussionR _)                    -> error "the impossible happened"
+    Just (NewUserDiscussionR _)                 -> error "the impossible happened"
+    Just (UserTicketsR _)                       -> error "the impossible happened"
+    Just (UserCommentR _ _)                     -> error "the impossible happened"
+    Just (ClaimUserCommentR _ _)                -> error "the impossible happened"
+    Just (CloseUserCommentR _ _)                -> error "the impossible happened"
+    Just (DeleteUserCommentR _ _)               -> error "the impossible happened"
+    Just (EditUserCommentR _ _)                 -> error "the impossible happened"
+    Just (FlagUserCommentR _ _)                 -> error "the impossible happened"
+    Just (ApproveUserCommentR _ _)              -> error "the impossible happened"
+    Just (ReplyUserCommentR _ _)                -> error "the impossible happened"
+    Just (RethreadUserCommentR _ _)             -> error "the impossible happened"
+    Just (RetractUserCommentR _ _)              -> error "the impossible happened"
+    Just (UserCommentAddTagR _ _)               -> error "the impossible happened"
+    Just (UserCommentTagsR _ _)                 -> error "the impossible happened"
+    Just (UserCommentTagR _ _ _)                -> error "the impossible happened"
+    Just (UserCommentApplyTagR _ _)             -> error "the impossible happened"
+    Just (UserCommentCreateTagR _ _)            -> error "the impossible happened"
+    Just (UnclaimUserCommentR _ _)              -> error "the impossible happened"
+    Just (WatchUserCommentR _ _)                -> error "the impossible happened"
+    Just (UnwatchUserCommentR _ _)              -> error "the impossible happened"
+    Just (UserChangePasswordR _)                -> error "the impossible happened"
+    Just (EditUserR _)                          -> error "the impossible happened"
+    Just (UserEstEligibleR _)                   -> error "the impossible happened"
+    Just (UserNotificationsR _)                 -> error "the impossible happened"
+    Just (UserPledgesR _)                       -> error "the impossible happened"
+    Just (UserResetPasswordR _ _)               -> error "the impossible happened"
+    Just (UserVerifyEmailR _ _)                 -> error "the impossible happened"
+    Just NotificationsR                         -> error "the impossible happened"
+    Just ArchivedNotificationsR                 -> error "the impossible happened"
+    Just (ArchiveNotificationR _)               -> error "the impossible happened"
+    Just ProjectsR                              -> error "the impossible happened"
+    Just (ProjectR _)                           -> error "the impossible happened"
+    Just (ApplicationsR _)                      -> error "the impossible happened"
+    Just (ApplicationR _ _)                     -> error "the impossible happened"
+    Just (ProjectBlogR _)                       -> error "the impossible happened"
+    Just (NewProjectBlogPostR _)                -> error "the impossible happened"
+    Just (ProjectBlogPostR _ _)                 -> error "the impossible happened"
+    Just (ProjectPledgeButtonR _)               -> error "the impossible happened"
+    Just (ProjectCommentR _ _)                  -> error "the impossible happened"
+    Just (ClaimProjectCommentR _ _)             -> error "the impossible happened"
+    Just (CloseProjectCommentR _ _)             -> error "the impossible happened"
+    Just (DeleteProjectCommentR _ _)            -> error "the impossible happened"
+    Just (EditProjectCommentR _ _)              -> error "the impossible happened"
+    Just (FlagProjectCommentR _ _)              -> error "the impossible happened"
+    Just (ApproveProjectCommentR _ _)           -> error "the impossible happened"
+    Just (ReplyProjectCommentR _ _)             -> error "the impossible happened"
+    Just (RethreadProjectCommentR _ _)          -> error "the impossible happened"
+    Just (RetractProjectCommentR _ _)           -> error "the impossible happened"
+    Just (ProjectCommentAddTagR _ _)            -> error "the impossible happened"
+    Just (ProjectCommentTagsR _ _)              -> error "the impossible happened"
+    Just (ProjectCommentTagR _ _ _)             -> error "the impossible happened"
+    Just (ProjectCommentApplyTagR _ _)          -> error "the impossible happened"
+    Just (ProjectCommentCreateTagR _ _)         -> error "the impossible happened"
+    Just (UnclaimProjectCommentR _ _)           -> error "the impossible happened"
+    Just (WatchProjectCommentR _ _)             -> error "the impossible happened"
+    Just (UnwatchProjectCommentR _ _)           -> error "the impossible happened"
+    Just (ProjectContactR _)                    -> error "the impossible happened"
+    Just (ProjectDiscussionR _)                 -> error "the impossible happened"
+    Just (NewProjectDiscussionR _)              -> error "the impossible happened"
+    Just (EditProjectR _)                       -> error "the impossible happened"
+    Just (ProjectFeedR _)                       -> error "the impossible happened"
+    Just (InvitationR _ _)                      -> error "the impossible happened"
+    Just (InviteR _)                            -> error "the impossible happened"
+    Just (ProjectPatronsR _)                    -> error "the impossible happened"
+    Just (UpdateSharesR _)                      -> error "the impossible happened"
+    Just (TicketsR _)                           -> error "the impossible happened"
+    Just (ProjectTransactionsR _)               -> error "the impossible happened"
+    Just (VolunteerR _)                         -> error "the impossible happened"
+    Just (WikiPagesR _)                         -> error "the impossible happened"
+    Just (WhoR _)                               -> error "the impossible happened"
+    Just (WidgetR _)                            -> error "the impossible happened"
+    Just (WatchProjectR _)                      -> error "the impossible happened"
+    Just (UnwatchProjectR _)                    -> error "the impossible happened"
+    Just (CommentDirectLinkR _)                 -> error "the impossible happened"
+    Just (CommentTagR _ _)                      -> error "the impossible happened"
+    Just ProjectSignupR                         -> error "the impossible happened"
+    Just LicenseEntryR                          -> error "the impossible happened"
+    -- Just ProjectApplicationsR                   -> error "the impossible happened"
+    -- Just (ProjectApplicationR _)                -> error "the impossible happened"
+    Just RepoFeedR                              -> error "the impossible happened"
+    Just BuildFeedR                             -> error "the impossible happened"
+
+  where
+    redirectSameParams url = do
+        params <- reqGetParams <$> getRequest
+        redirectParams url params
+
+redirectPolylingualWiki :: (Maybe (Route App) -> Handler Html) -> Text -> Text -> [Text] -> Handler Html
+redirectPolylingualWiki fn project_handle target rest = do
+    render <- getUrlRender
+    app <- getYesod
+
+    let url = render $ MonolingualWikiR project_handle "en" (target:rest)
+        splitPath  = drop 1 . T.splitOn "/"
+        stripQuery = fst . T.break (== '?')
+        stripRoot  = fromMaybe url . T.stripPrefix (appRoot $ settings app)
+
+    fn $ parseRoute $ (, []) $ splitPath $ stripQuery $ stripRoot url
 
 
 -- This handles any links we might have to the old /history/# style links
@@ -359,159 +683,5 @@ getWikiDiffR project_handle target start_edit_id end_edit_id = do
 -- something break or can check that there's no such links
 -- (it's unlikely there's any at all, certainly if so they are
 -- almost certainly internal anyway)
-getOldWikiEditR :: Text -> Text -> WikiEditId -> Handler Html
-getOldWikiEditR project_handle target edit_id = redirect $ WikiEditR project_handle target edit_id
-
-
-getWikiEditR :: Text -> Text -> WikiEditId -> Handler Html
-getWikiEditR project_handle target edit_id = do
---    _ <- requireAuthId
-
-    (Entity project_id project, Entity page_id _) <- getPageInfo project_handle target
-    edit <- runDB $ do
-        edit <- get404 edit_id
-
-        when (page_id /= wikiEditPage edit) $ error "selected edit is not an edit of selected page"
-
-        return edit
-
-    defaultLayout $ do
-    -- TODO: prettier date format? or edit id?
-        setTitle . toHtml $ projectName project <> " Wiki - " <> target <> " at " <> T.pack (show $ wikiEditTs edit) <> " | Snowdrift.coop"
-        $(widgetFile "wiki_edit")
-
-
-getWikiNewEditsR :: Text -> Handler Html
-getWikiNewEditsR project_handle = do
-    mauth <- maybeAuth
-    Entity project_id project <- runDB $ getBy404 $ UniqueProjectHandle project_handle
-
-    maybe_from <- fmap (Key . PersistInt64 . read . T.unpack) <$> lookupGetParam "from"
-
-    req <- getRequest
-    maybe_since <- lookupGetParam "since"
-    since :: UTCTime <- case mauth of
-        Nothing -> liftIO getCurrentTime
-        Just (Entity viewer_id viewer) -> case maybe_since of
-            Nothing -> do
-                viewtimes :: [Entity ViewTime] <- runDB $ select $ from $ \ viewtime -> do
-                        where_ $
-                            ( viewtime ^. ViewTimeUser ==. val viewer_id ) &&.
-                            ( viewtime ^. ViewTimeProject ==. val project_id ) &&.
-                            ( viewtime ^. ViewTimeType ==. val ViewEdits )
-                        return viewtime
-
-                let comments_ts = case viewtimes of
-                        [] -> userReadEdits viewer
-                        Entity _ viewtime : _ -> viewTimeTime viewtime
-
-                redirectParams (WikiNewEditsR project_handle) $ (T.pack "since", T.pack $ show comments_ts) : reqGetParams req
-
-            Just since -> return (read . T.unpack $ since)
-
-    now <- liftIO getCurrentTime
-
-
-    (new_edits, old_edits, pages, users) :: ([Entity WikiEdit], [Entity WikiEdit], M.Map WikiPageId (Entity WikiPage), M.Map UserId (Entity User)) <- runDB $ do
-        pages <- fmap (M.fromList . map (entityKey &&& id)) $ select $ from $ \ page -> do
-            where_ $ page ^. WikiPageProject ==. val project_id
-            return page
-
-{-
-        viewtimes :: [Entity ViewTime] <- select $ from $ \ viewtime -> do
-            where_ $
-                ( viewtime ^. ViewTimeUser ==. val viewer_id ) &&.
-                ( viewtime ^. ViewTimeProject ==. val project_id ) &&.
-                ( viewtime ^. ViewTimeType ==. val ViewEdits )
-            return viewtime
-
-        let edits_ts = case viewtimes of
-                [] -> userReadEdits viewer
-                (Entity _ viewtime):_ -> viewTimeTime viewtime
--}
-        new_edits :: [Entity WikiEdit] <- select $ from $ \ edit -> do
-            where_ $
-                case maybe_from of
-                    Nothing ->
-                        ( edit ^. WikiEditPage `in_` valList (M.keys pages) ) &&.
-                        ( edit ^. WikiEditTs >=. val since )
-                    Just from_edit ->
-                        ( edit ^. WikiEditPage `in_` valList (M.keys pages) ) &&.
-                        ( edit ^. WikiEditId <=. val from_edit ) &&.
-                        ( edit ^. WikiEditTs >=. val since )
-
-            orderBy [ desc (edit ^. WikiEditId) ]
-            limit 51
-            return edit
-
-        old_edits :: [Entity WikiEdit] <- select $ from $ \ edit -> do
-            where_ $
-                case maybe_from of
-                    Nothing ->
-                        ( edit ^. WikiEditPage `in_` valList ( M.keys pages) ) &&.
-                        ( edit ^. WikiEditTs <. val since )
-                    Just from_edit ->
-                        ( edit ^. WikiEditPage `in_` valList (M.keys pages) ) &&.
-                        ( edit ^. WikiEditId <=. val from_edit ) &&.
-                        ( edit ^. WikiEditTs <. val since )
-            orderBy [ desc (edit ^. WikiEditId) ]
-            limit $ fromIntegral $ 51 - length new_edits
-            --offset $ fromIntegral $ length new_edits
-            return edit
-
-        let user_ids = S.toList $ S.fromList $ map (wikiEditUser . entityVal) (new_edits <> old_edits)
-        users <- fmap (M.fromList . map (entityKey &&& id)) $ selectList [ UserId <-. user_ids ] []
-        return (new_edits, old_edits, pages, users)
-
-    let new_edits' = take 50 new_edits
-        old_edits' = take (50 - length new_edits') old_edits
-        show_older = (length new_edits + length old_edits) > 50
-        PersistInt64 to = unKey $ minimum (map entityKey (new_edits' <> old_edits'))
-        renderEdit (Entity edit_id edit) =
-            let editor = users M.! wikiEditUser edit
-                page = pages M.! wikiEditPage edit
-             in [whamlet|
-                    <tr>
-                        <td>
-                            <a href="@{WikiEditR project_handle (wikiPageTarget (entityVal page)) edit_id}">
-                                #{wikiPageTarget (entityVal page)}
-
-                        <td>
-                            ^{renderTime (wikiEditTs edit)}
-
-                        <td>
-                            <a href="@{UserR (entityKey editor)}">
-                                #{userPrintName editor}
-                        <td>
-                            $maybe comment <- wikiEditComment edit
-                                #{comment}
-                |]
-
-    case mauth of
-        Nothing -> return ()
-        Just (Entity viewer_id _) -> runDB $ do
-            c <- updateCount $ \ viewtime -> do
-                    set viewtime [ ViewTimeTime =. val now ]
-                    where_ $
-                        ( viewtime ^. ViewTimeUser ==. val viewer_id ) &&.
-                        ( viewtime ^. ViewTimeProject ==. val project_id ) &&.
-                        ( viewtime ^. ViewTimeType ==. val ViewEdits )
-
-            when (c == 0) $ insert_ $ ViewTime viewer_id project_id ViewEdits now
-
-    defaultLayout $ do
-        setTitle . toHtml $ projectName project <> " - New Wiki Edits | Snowdrift.coop"
-        $(widgetFile "wiki_new_edits")
-
-
-editWikiForm :: WikiEditId -> Markdown -> Maybe Text -> Form (WikiEditId, Markdown, Text)
-editWikiForm last_edit_id content comment = renderBootstrap3 $ (,,)
-        <$> areq' hiddenField "" (Just last_edit_id)
-        <*> areq' snowdriftMarkdownField "Page Content" (Just content)
-        <*> areq' textField "Comment" comment
-
-
-newWikiForm :: Maybe Markdown -> Form Markdown
-newWikiForm content = renderBootstrap3 $ areq' snowdriftMarkdownField "Page Content" content
-
-
+getOldWikiEditR :: Text -> Language -> Text -> WikiEditId -> Handler Html
+getOldWikiEditR project_handle language target edit_id = redirect $ WikiEditR project_handle language target edit_id

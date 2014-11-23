@@ -1,27 +1,41 @@
 <div .row>
     <div .col-md-6>
+        $if Just user_id == mviewer_id
+            <div .row>
+                <h5>
+                    <div .col-xs-6>
+                        <a href="@{EditUserR user_id}">
+                            edit profile
+                    <div .col-xs-6>
+                        <a href="@{UserChangePasswordR user_id}">
+                            change password
+                    <div .col-xs-6>
+                        <a href="@{UserNotificationsR user_id}">
+                            notification preferences
         <h1>
-            #{userPrintName user_entity}
-        <h5>
-            $if Just user_id == viewer_id
-                <a href="@{EditUserR user_id}">
-                    edit profile
+            #{userDisplayName user_entity}
         <div .row>
-            <div .col-xs-4>
-                $maybe avatar <- userAvatar user
-                    <img .headshot_large src="#{avatar}">
-                $if isJust $ userEstablishedTs user
+            $maybe avatar <- userAvatar user
+                <div .col-sm-5>
+                    <figure>
+                        <img .headshot src="#{avatar}">
+            <div .col-sm-7>
+                $if userIsEstablished user
                     <small>established user
-            <div. col-xs-8>
+                    <br>
+                $if Just user_id == mviewer_id
+                    $maybe email <- userEmail user
+                        #{email} (not shown publicly)
+                    <br>
                 $maybe nick <- userIrcNick user
-                    #{nick} on <a href="https://snowdrift.coop/p/snowdrift/w/irc">irc.freenode.net</a>
+                    #{nick} on <a href=@{WikiR "snowdrift" LangEn "irc"}>irc.freenode.net</a>
 
     <div .col-md-6>
         $maybe blurb <- userBlurb user
-            ^{markdownWidget project_handle blurb}
+            ^{markdownWidget blurb}
         $nothing
             &nbsp;
-
+<hr>
 <div .row>
 
     <div .col-md-6>
@@ -35,18 +49,39 @@
                    $forall role <- presentationRoles
                      <th>#{ roleLabel role }
             <tbody>
-                $forall ((projectName, projectHandle), roles) <- Map.toAscList projects
+                $forall (Entity _ project, roles) <- M.toAscList projects_and_roles
                     <tr>
-                    <td><a href=@{ProjectR $ projectHandle}>
-                        #{projectName }
+                    <td><a href=@{ProjectR (projectHandle project)}>
+                        #{projectName project}
 
                     $forall role' <- presentationRoles
                         <td>
-                            $if Set.member role' roles
+                            $if S.member role' roles
+                                $# check mark
                                 &#10004;
 
     <div .col-md-6>
         $maybe statement <- userStatement user
             <h3>Personal Statement
             <div .well .well-sm .scroll .capped>
-                ^{markdownWidget project_handle statement}
+                ^{markdownWidget statement}
+
+$maybe (est_form, est_form_enctype) <- mest_form_and_enctype
+    <div .row>
+        <div .col-md-6 #establish-form>
+            <h4>Establish User
+            <p>
+                As a project moderator, you can mark users eligible for "establishment".
+                Established users have additional permissions such as
+                flagging, tagging, and commenting without moderation.
+            <p>
+                Approve of this user if you now trust them to be legitimate
+                (e.g. they have posted several helpful, on-topic comments,
+                and are clearly not a spammer or malicious troll).
+                They will then become fully established after affirming
+                the <a href="@{WikiR "snowdrift" LangEn "honor"}">honor pledge</a>.
+
+            <form action=@{UserEstEligibleR user_id} method=post enctype=#{est_form_enctype}>
+                ^{est_form}
+                <input type=submit value="Approve">
+

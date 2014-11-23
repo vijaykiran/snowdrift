@@ -9,25 +9,29 @@
             General Project Info
         <div .row>
             <div .form-group>
-                <div .col-md-1>
-                    <label>Project Name:
                 <div .col-md-4>
+                    <label for=#{fvId projectNameView}>
+                        Project Name:
                     ^{fvInput projectNameView}
-                <div .col-md-offset-1 .col-md-1>
-                    <label>Website:
+
                 <div .col-md-5>
+                    <label for=#{fvId projectWebsiteView}>
+                        Website:
                     ^{fvInput projectWebsiteView}
         <div .row>
             <div .form-group>
-                <div .col-md-1>
-                    <label>
-                        Select Applicable Project Type(s):
                 <div .col-md-4>
+                    <label for=#{fvId projectTypeView}>
+                        Select Applicable Project Type(s):
                     ^{fvInput projectTypeView}
-                <div .col-md-offset-1 .col-md-1>
-                    <label>
-                        Select Applicable Project License(s):
+
+                    <label for=#{fvId projectTypeOtherView}>
+                        Other:
+                    ^{fvInput projectTypeOtherView}
+
                 <div .col-md-5>
+                    <label for=#{fvId projectLicenseView}>
+                        Select Applicable Project License(s):
                     ^{fvInput projectLicenseView}
 
     <br>
@@ -36,21 +40,21 @@
             Legal Information
         <div .row>
             <div .form-group>
-                <div .col-md-1>
-                    <label>Location Project is legally based out of:
                 <div .col-md-5>
+                    <label for=#{fvId projectLocationView}>
+                        Location Project is legally based out of:
                     ^{fvInput projectLocationView}
-                <div .col-md-2 align="right">
-                    <label>
-                        <p>
-                            Legal Status:
+
                 <div .col-md-4>
+                    <label for=#{fvId projectLegalStatusView}>
+                        Legal Status:
                     ^{fvInput projectLegalStatusView}
+
         <div .row>
             <div .form-group>
-                <div .col-md-2>
-                    <label>Additional Comments about Legal Status:
                 <div .col-md-10>
+                    <label for=#{fvId projectLegalStatusCommentsView}>
+                        Additional Comments about Legal Status:
                     ^{fvInput projectLegalStatusCommentsView}
 
     <br>
@@ -59,19 +63,20 @@
             Project Intent
         <div .row>
             <div .form-group>
-                <div .col-md-2>
-                    <label>Describe your project's vision and mission:
                 <div .col-md-10>
+                    <label for=#{fvId projectMissionView}>
+                        Describe your project's vision and mission:
                     ^{fvInput projectMissionView}
         <div .row>
             <div .form-group>
-                <div .col-md-2>
-                    <label>Describe your project's short-term and long-term goals and deliverables:
                 <div .col-md-10>
+                    <label for=#{fvId projectGoalsView}>
+                        Describe your project's short-term and long-term goals and deliverables:
                     ^{fvInput projectGoalsView}
+
         <div .row>
             <div .form-group>
-                <div .col-md-2>
-                    <label>Describe how your project will benefit from and make use of funds raised through Snowdrift.coop:
                 <div .col-md-10>
+                    <label for=#{fvId projectFundsView}>
+                        Describe how your project will benefit from and make use of funds raised through Snowdrift.coop:
                     ^{fvInput projectFundsView}

@@ -1,23 +1,16 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE TemplateHaskell #-}
 
-module TestImport
-    ( runDB
-    , Spec
-    , Example
-    , needsLogin
-    , login
-    , liftIO
-    , extractLocation
-    , statusIsResp
-    , module TestImport
-    ) where
+module TestImport (module TestImport) where
+
+import Prelude hiding (exp)
 
 import Yesod (Yesod, RedirectUrl)
 import Yesod.Test as TestImport
 import Database.Persist as TestImport hiding (get)
 import Database.Persist.Sql (SqlPersistM, runSqlPersistMPool)
-import Control.Monad.IO.Class (liftIO, MonadIO)
+import Control.Monad.IO.Class as TestImport (liftIO, MonadIO)
 
 import Network.URI (URI (uriPath), parseURI)
 import Network.HTTP.Types (StdMethod (..), renderStdMethod)
@@ -29,6 +22,7 @@ import qualified Data.ByteString as B
 
 import qualified Data.Text as T
 import Data.Text (Text)
+import Data.String
 
 import Data.Text.Encoding (decodeUtf8)
 import Foundation as TestImport
@@ -36,12 +30,29 @@ import Model as TestImport
 
 import Control.Monad (when)
 
+import qualified Language.Haskell.Meta.Parse as Exp
+import qualified Language.Haskell.TH as TH
+import           Language.Haskell.TH.Quote
+
+import qualified Language.Haskell.Exts.Parser as Src
+import qualified Language.Haskell.Exts.SrcLoc as Src
+import qualified Language.Haskell.Exts.Pretty as Src
+import qualified Language.Haskell.Exts.Annotated.Syntax as Src
+
+import System.IO (hPutStrLn, stderr)
+
+import Control.Monad.Trans.Control
+import Control.Exception.Lifted as Lifted
+
+
+onException :: MonadBaseControl IO m => m a -> m b -> m a
+onException = Lifted.onException
 
 type Spec = YesodSpec App
 type Example = YesodExample App
 
-runDB :: SqlPersistM a -> Example a
-runDB query = do
+testDB :: SqlPersistM a -> Example a
+testDB query = do
     pool <- fmap connPool getTestYesod
     liftIO $ runSqlPersistMPool query pool
 
@@ -87,7 +98,6 @@ submitLogin user pass = do
         addPostParam "username" user
         addPostParam "password" pass
 
-    extractLocation >>= liftIO . print
 
 extractLocation :: YesodExample site (Maybe B.ByteString)
 extractLocation = do
@@ -104,26 +114,97 @@ needsLogin method url = do
     mbloc <- firstRedirect method url
     maybe (assertFailure "Should have location header") (assertLoginPage . decodeUtf8) mbloc
 
+
+data NamedUser = Bob | Mary | Joe | Sue deriving (Eq, Bounded, Enum)
+data TestUser = TestUser
+data AdminUser = AdminUser
+
+class Login a where
+    username :: IsString name => a -> name
+    password :: IsString pass => a -> pass
+
+instance Login NamedUser where
+    username Bob =  "bob"
+    username Mary = "mary"
+    username Joe =  "joe"
+    username Sue =  "sue"
+
+    password Bob =  "bob password"
+    password Mary = "mary password"
+    password Joe =  "joe password"
+    password Sue =  "sue password"
+
+instance Login TestUser where
+    username _ = "test"
+    password _ = "test"
+
+instance Login AdminUser where
+    username _ = "admin"
+    password _ = "admin"
+
 -- Do a login (using hashdb auth).  This just attempts to go to the home
 -- url, and follows through the login process.  It should probably be the
 -- first thing in each "it" spec.
 --
-login :: (Yesod site) => YesodExample site ()
-login = do
-    liftIO $ putStrLn "Logging in..."
+loginAs :: (Yesod site, Login user) => user -> YesodExample site ()
+loginAs user = do
     get $ urlPath $ testRoot `T.append` "/auth/login"
     statusIs 200
-    liftIO $ putStrLn "Submitting login."
-    submitLogin "test" "test"
-
-    liftIO $ putStrLn "Logged in."
+    submitLogin (username user) (username user)
 
 
 statusIsResp :: Int -> YesodExample site ()
 statusIsResp number = withResponse $ \ SResponse { simpleStatus = s } -> do
-  when (H.statusCode s /= number) printBody
-  liftIO $ flip HUnit.assertBool (H.statusCode s == number) $ concat
-    [ "Expected status was ", show number
-    , " but received status was ", show $ H.statusCode s
-    ]
+    let errMsg = concat
+            [ "Expected status was ", show number
+            , " but received status was ", show $ H.statusCode s
+            ]
+
+    when (H.statusCode s /= number) $ do
+        liftIO $ hPutStrLn stderr $ errMsg ++ ":"
+        printBody
+        liftIO $ hPutStrLn stderr ""
+
+    liftIO $ flip HUnit.assertBool (H.statusCode s == number) errMsg
+
+
+marked :: QuasiQuoter
+marked = QuasiQuoter
+    { quoteExp = decorate
+    , quotePat = fail "no pattern for marked"
+    , quoteType = fail "no type for marked"
+    , quoteDec = fail "no declaration for marked"
+    }
+  where
+    decorate input = do
+        loc <- TH.location
+        let file = TH.loc_filename loc
+            (line, _) = TH.loc_start loc
+
+            fixup 1 = 0
+            fixup x = x - 2
+
+            onException_ l = Src.QVarOp l $ Src.Qual l (Src.ModuleName l "TestImport") (Src.Ident l "onException")
+            report l =
+                let str = file ++ ":" ++ show (line + fixup (Src.srcLine l)) ++ ": exception raised here"
+                 in Src.App l
+                        (Src.Var l $ Src.Qual l (Src.ModuleName l "TestImport") (Src.Ident l "liftIO"))
+                      $ Src.App l
+                            (Src.Var l $ Src.Qual l (Src.ModuleName l "Prelude") (Src.Ident l "putStrLn"))
+                            (Src.Lit l $ Src.String l str str)
+
+            mark l e = Src.InfixApp l (Src.Paren l e) (onException_ l) (report l)
+
+            decorateExp :: Src.Exp Src.SrcLoc -> Src.Exp Src.SrcLoc
+            decorateExp (Src.Do l stmts) = mark l $ Src.Do l $ map decorateStmt stmts
+            decorateExp exp = mark (Src.ann exp) exp
+
+            decorateStmt :: Src.Stmt Src.SrcLoc -> Src.Stmt Src.SrcLoc
+            decorateStmt (Src.Generator l pat exp) = Src.Generator l pat $ decorateExp exp
+            decorateStmt (Src.Qualifier l exp) = Src.Qualifier l $ decorateExp exp
+            decorateStmt stmt = stmt
+
+        case Src.parse ("do\n" ++ input) of
+            Src.ParseOk a -> either fail return $ Exp.parseExp $ Src.prettyPrint $ decorateExp a
+            Src.ParseFailed _ e -> fail e
 

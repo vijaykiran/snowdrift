@@ -7,14 +7,6 @@
         <ul .nav .navbar-nav .navbar-left>
             <li>
                 <a href=@{ProjectsR}> Browse Projects
-            $maybe _ <- maybe_user
-                <li>
-                    <p .navbar-text .text-center>
-                        <a href=@{ProjectsR}>
-                            new activity
-                            <br>
-                            <span .badge>
-                                #{comments + edits}
         <ul .nav .navbar-nav .navbar-right>
             $maybe Entity user_id user <- maybe_user
                 <li>
@@ -23,15 +15,15 @@
                             Pledges / Funds 
                             <br>
                             <a .navbar-link title="Current total monthly pledge" href="@{UserPledgesR user_id}">
-                                #{show pledged}
+                                #{milrayCents pledged}
                             /
                             <a .navbar-link title="Current balance" href="@{UserBalanceR user_id}">
-                                #{show balance}
+                                #{milrayCents balance}
                 <li>
-                    <a href=@{MessagesR}>
-                        $if not (null messages)
+                    <a href=@{NotificationsR}>
+                        $if num_unread_notifs /= 0
                             <span .glyphicon .glyphicon-envelope>&nbsp;
-                                #{length messages}
+                                #{num_unread_notifs}
                         $else
                             <span .glyphicon .glyphicon-envelope>
                 $with name <- fromMaybe (userIdent user) $ userName user 
@@ -52,13 +44,6 @@
                 <a href=@{ProjectsR}> Projects
             $maybe Entity user_id _ <- maybe_user
                 <li>
-                    <p .navbar-text .text-center>
-                        <a href=@{ProjectsR}>
-                            new activity
-                            <br>
-                            <span .badge>
-                                #{comments + edits}
-                <li>
                     $maybe (balance, pledged) <- money_info
                         <p .navbar-text .text-center>
                             Pledges / Funds 
@@ -71,10 +56,10 @@
         <ul .nav .nav-pills .navbar-right>
             $maybe Entity user_id user <- maybe_user
                 <li>
-                    <a href="@{MessagesR}">
-                        $if not (null messages)
+                    <a href="@{NotificationsR}">
+                        $if num_unread_notifs /= 0
                             <span .glyphicon .glyphicon-envelope>&nbsp;
-                                #{length messages}
+                                #{num_unread_notifs}
                         $else
                             <span .glyphicon .glyphicon-envelope>
                 $with name <- fromMaybe (userIdent user) $ userName user 
@@ -86,11 +71,3 @@
                 <li>
                     <a href=@{AuthR LoginR}>Sign In
 
-        $# TODO
-        $# $if not (null applications)
-        $#     <strong>
-        $#         <a href="@{ApplicationsR}">
-        $#             _{MsgNewApplications (length applications)}
-        $#     <br>
-        $# $else
-        $#     ^{sb_link ApplicationsR "View Applications"}

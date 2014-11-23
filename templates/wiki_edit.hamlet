@@ -1,18 +1,17 @@
 <p>
-    Page as of ^{renderTime (wikiEditTs edit)}
+    Page as of ^{renderTime (wikiEditTs wiki_edit)}
     <br>
     Edit comment: #
-    $maybe comment <- wikiEditComment edit
+    $maybe comment <- wikiEditComment wiki_edit
         #{comment}
+<hr>
 
-<div .row>
-    <div .col-sm-4>
-        <a href="@{WikiHistoryR project_handle target}">back to history
-    <div .col-sm-4>
-        <a href="@{WikiR project_handle target}">current version
-    <div .col-sm-4>
-        <a href="@{DiscussWikiR project_handle target}">view discussion
+<div .page-toolbox>
+    <div .page-tool>
+        <a href="@{WikiHistoryR project_handle language target}">back to history
+    <div .page-tool>
+        <a href="@{WikiR project_handle language target}">current version
+    <div .page-tool>
+        <a href="@{WikiDiscussionR project_handle language target}">view discussion
 
-<hr .wikitop>
-^{markdownWidget project_handle (wikiEditContent edit)}
-
+^{markdownWidgetWith (fixLinks project_handle discussion) (wikiEditContent wiki_edit)}

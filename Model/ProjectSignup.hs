@@ -3,7 +3,6 @@ module Model.ProjectSignup where
 import Model.ProjectSignup.Internal
 import Import
 import Data.List as L
-import Data.Text as T
 
 getProjectTypeLabel :: ProjectType -> Text
 getProjectTypeLabel pt = case pt of

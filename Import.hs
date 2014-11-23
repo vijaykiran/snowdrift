@@ -1,47 +1,48 @@
 {-# LANGUAGE CPP, DeriveDataTypeable, TypeFamilies #-}
+{-# OPTIONS_GHC -fno-warn-orphans #-}
 
-module Import ( module Import ) where
+module Import (module Import) where
 
+import           Foundation                    as Import
+import           Model                         as Import
+import           Model.Language                as Import
+import           Model.Comment.Internal        as Import
+import           Model.Established.Internal    as Import
+import           Model.Role.Internal           as Import
+import           Model.SnowdriftEvent.Internal as Import
+import           Settings                      as Import
+import           Settings.Development          as Import
+import           Settings.StaticFiles          as Import
 
-import           Prelude              as Import hiding (head, init, last,
-                                                 readFile, tail, writeFile)
-import           Yesod                as Import hiding (Route (..), (||.), (==.), (!=.), (<.), (<=.), (>.), (>=.), (=.), (+=.), (-=.), (*=.), (/=.), selectSource, delete, update, count, Value)
-import           Yesod.Auth           as Import
-import           Yesod.Markdown       as Import (Markdown)
-import           Text.Blaze.Html.Renderer.Text (renderHtml)
-
-import           Control.Arrow        as Import ((***), (&&&), first, second)
-
-import           Database.Esqueleto   as Import hiding (on)
+import           Control.Applicative           as Import (pure, (<$>), (<*>))
+import           Control.Arrow                 as Import ((***), (&&&), first, second)
+import           Control.Monad                 as Import
+import           Data.Function                 as Import (on)
+import           Data.Int                      as Import (Int64)
+import           Data.Map                      as Import (Map)
+import           Data.Maybe                    as Import (fromMaybe, listToMaybe, mapMaybe, isJust, catMaybes)
+import           Data.Set                      as Import (Set)
+import           Data.Text                     as Import (Text)
+import qualified Data.Text                     as T
+import           Data.Time.Clock               as Import (UTCTime, diffUTCTime, getCurrentTime)
+import           Data.Typeable (Typeable)
+import           Database.Esqueleto            as Import hiding (on, valList)
 import qualified Database.Esqueleto
+import           Database.Esqueleto.Internal.Sql (unsafeSqlBinOp)
+import           Network.Mail.Mime               (randomString)
+import           Prelude                       as Import hiding (head, init, last, readFile, tail, writeFile)
+import           System.Random                 (newStdGen)
+import           Yesod                         as Import hiding (Route (..), (||.), (==.), (!=.), (<.), (<=.), (>.), (>=.), (=.), (+=.), (-=.), (*=.), (/=.), selectSource, delete, update, count, Value, runDB, languages)
+import           Yesod.Auth                    as Import
+import           Yesod.Markdown                as Import (Markdown)
+import           Yesod.Form.Bootstrap3         as Import
 
-import           Control.Applicative  as Import (pure, (<$>), (<*>))
-import           Data.Text            as Import (Text)
-import qualified Data.Text            as T
-import qualified Data.Text.Lazy       as TL
+import           Yesod (languages)
+import           Data.List (sortBy, (\\))
 
-import           Data.Function        as Import (on)
-
-import           Data.Map             as Import (Map)
-import           Data.Set             as Import (Set)
-
-import           Foundation           as Import
-import           Model                as Import
-import           Settings             as Import
-import           Settings.Development as Import
-import           Settings.StaticFiles as Import
-
-import           Data.Maybe           as Import (fromMaybe, listToMaybe, mapMaybe, isJust, catMaybes)
-
-import           Data.Int             as Import (Int64)
-
-import           Control.Monad        as Import
-
-import           Data.Time.Clock      as Import (UTCTime, diffUTCTime, getCurrentTime)
-import           Data.Time.Units
-
-import Control.Exception (Exception)
-import Data.Typeable (Typeable)
+import GHC.Exts (IsList(..))
+import qualified Data.Map as M
+import qualified Data.Set as S
 
 #if __GLASGOW_HASKELL__ >= 704
 import           Data.Monoid          as Import (Monoid (mappend, mempty, mconcat), (<>))
@@ -53,10 +54,30 @@ infixr 5 <>
 (<>) = mappend
 #endif
 
+instance Ord a => IsList (Set a) where
+    type Item (Set a) = a
+    fromList = S.fromList
+    toList = S.toList
 
 on_ :: Esqueleto query expr backend => expr (Value Bool) -> query ()
 on_ = Database.Esqueleto.on
 
+-- Like Database.Esqueleto.valList, but more generic.
+valList :: (Esqueleto query expr backend, PersistField typ, IsList l, typ ~ Item l) => l -> expr (ValueList typ)
+valList = Database.Esqueleto.valList . toList
+
+infix 4 `notDistinctFrom`
+notDistinctFrom :: SqlExpr (Value a) -> SqlExpr (Value a)
+                -> SqlExpr (Value Bool)
+notDistinctFrom = unsafeSqlBinOp " IS NOT DISTINCT FROM "
+
+selectCount :: (MonadResource m, MonadSqlPersist m) => SqlQuery a -> m Int
+selectCount from_ =
+    fmap (\[Value n] -> n) $
+    select $ from_ >> return countRows
+
+newHash :: IO Text
+newHash = T.pack . fst . randomString 42 <$> newStdGen
 
 class Count a where
     getCount :: a -> Int64
@@ -69,26 +90,28 @@ instance Count ShareCount where getCount (ShareCount c) = c
 
 newtype Color = Color Int deriving (Typeable, Num)
 
--- from http://stackoverflow.com/questions/8066850/why-doesnt-haskells-prelude-read-return-a-maybe
-readMaybe        :: (Read a) => String -> Maybe a
-readMaybe s      =  case [x | (x,t) <- reads s, ("","") <- lex t] of
-                         [x] -> Just x
-                         _   -> Nothing
+showDiffTime :: UTCTime -> UTCTime -> String
+showDiffTime x y =
+  let secs_ago = round (diffUTCTime x y)
+  in if | secs_ago < secsPerHour  -> go secs_ago secsPerMinute "m"
+        | secs_ago < secsPerDay   -> go secs_ago secsPerHour   "h"
+        | secs_ago < secsPerWeek  -> go secs_ago secsPerDay    "d"
+        | secs_ago < secsPerMonth -> go secs_ago secsPerWeek   "wk"
+        | secs_ago < secsPerYear  -> go secs_ago secsPerMonth  "mo"
+        | otherwise               -> go secs_ago secsPerYear   "yr"
+  where
+    go secs_ago divisor suffix = show (secs_ago `div` divisor) ++ suffix
 
+    secsPerMinute, secsPerHour, secsPerDay, secsPerWeek, secsPerMonth, secsPerYear :: Integer
+    secsPerMinute = 60
+    secsPerHour   = 3600     -- 60*60
+    secsPerDay    = 86400    -- 60*60*24
+    secsPerWeek   = 604800   -- 60*60*24*7
+    secsPerMonth  = 2592000  -- 60*60*24*30
+    secsPerYear   = 31536000 -- 60*60*24*365
 
-age :: UTCTime -> UTCTime -> String
-age a b = let s = round $ toRational $ diffUTCTime a b
-              f (t :: Second)
-                 | t > convertUnit (1 :: Fortnight) = show (convertUnit t :: Fortnight)
-                 | t > convertUnit (1 :: Week) = show (convertUnit t :: Week)
-                 | t > convertUnit (1 :: Day) = show (convertUnit t :: Day)
-                 | t > convertUnit (1 :: Hour) = show (convertUnit t :: Hour)
-                 | otherwise = show (convertUnit t :: Minute)
-           in f s
-
-
-entityPairs :: [Entity t] -> [(Key t, t)]
-entityPairs = map (\ (Entity a b) -> (a, b))
+entitiesMap :: [Entity t] -> Map (Key t) t
+entitiesMap = foldr (\(Entity k v) -> M.insert k v) mempty
 
 -- allow easier creation of pretty bootstrap 3 forms. there has to be an easier way -_-
 --fieldSettings :: forall master . SomeMessage master -> [(Text, Text)] -> FieldSettings master
@@ -108,26 +131,6 @@ areq' :: (RenderMessage site FormMessage, HandlerSite m ~ site, MonadHandler m)
     -> AForm m a
 areq' a b = areq a (FieldSettings b Nothing Nothing Nothing [("class", "form-control")])
 
-renderBootstrap3 :: Monad m => FormRender m a
-renderBootstrap3 aform fragment = do
-    (res, views') <- aFormToForm aform
-    let views = views' []
-        has (Just _) = True
-        has Nothing  = False
-    let widget = [whamlet|
-                $newline never
-                \#{fragment}
-                $forall view <- views
-                    <div .form-group :fvRequired view:.required :not $ fvRequired view:.optional :has $ fvErrors view:.error>
-                        $if not ( TL.null ( Text.Blaze.Html.Renderer.Text.renderHtml ( fvLabel view )))
-                            <label for=#{fvId view}>#{fvLabel view}
-                        ^{fvInput view}
-                        $maybe tt <- fvTooltip view
-                            <span .help-block>#{tt}
-                        $maybe err <- fvErrors view
-                            <span .help-block>#{err}
-                |]
-    return (res, widget)
 
 radioField' :: (Eq a, RenderMessage site FormMessage)
            => HandlerT site IO (OptionList a)
@@ -163,16 +166,16 @@ selectFieldHelper' outside onOpt inside opts' = Field
     { fieldParse = \x _ -> do
         opts <- opts'
         return $ selectParser opts x
-    , fieldView = \theId name attrs val isReq -> do
+    , fieldView = \theId name attrs value isReq -> do
         opts <- fmap olOptions $ handlerToWidget opts'
         outside theId name attrs $ do
-            unless isReq $ onOpt theId name $ not $ render opts val `elem` map optionExternalValue opts
+            unless isReq $ onOpt theId name $ not $ render opts value `elem` map optionExternalValue opts
             flip mapM_ opts $ \opt -> inside
                 theId
                 name
                 ((if isReq then (("required", "required"):) else id) attrs)
                 (optionExternalValue opt)
-                ((render opts val) == optionExternalValue opt)
+                ((render opts value) == optionExternalValue opt)
                 (optionDisplay opt)
     , fieldEnctype = UrlEncoded
     }
@@ -209,10 +212,12 @@ checkboxesField' :: (Eq a, RenderMessage site FormMessage)
                  -> Field (HandlerT site IO) [a]
 checkboxesField' ioptlist = (multiSelectField ioptlist)
     { fieldView =
-        \theId name attrs value isReq -> do
+        \theId name attrs value _ -> do
             opts <- fmap olOptions $ handlerToWidget ioptlist
+
             let optselected (Left _) _ = False
                 optselected (Right vals) opt = (optionInternalValue opt) `elem` vals
+
             [whamlet|
                 <span ##{theId}>
                     $forall opt <- opts
@@ -222,20 +227,31 @@ checkboxesField' ioptlist = (multiSelectField ioptlist)
                 |]
     }
 
+
 redirectParams :: (MonadHandler (HandlerT site m), MonadBaseControl IO m) => Route site -> [(Text, Text)] -> HandlerT site m a
 redirectParams route params = getUrlRenderParams >>= \ render -> redirect $ render route params
 
-
-getByErr message = runDB . fmap fromJustError . getBy
+getByErr :: (PersistEntity val, PersistEntityBackend val ~ SqlBackend)
+         => String -> Unique val -> Handler (Entity val)
+getByErr message = runYDB . fmap fromJustError . getBy
     where
         fromJustError :: Maybe a -> a
         fromJustError = fromMaybe (error message)
 
+lookupErr :: Ord k => String -> k -> Map k a -> a
+lookupErr = M.findWithDefault . error
 
--- maybe we should make this a typeclass?
+fromJustErr :: String -> Maybe a -> a
+fromJustErr _   (Just x) = x
+fromJustErr msg _        = error msg
+
 class WrappedValues a where
     type Unwrapped a
     unwrapValues :: a -> Unwrapped a
+
+instance WrappedValues a => WrappedValues [a] where
+    type Unwrapped [a] = [Unwrapped a]
+    unwrapValues = map unwrapValues
 
 instance WrappedValues (Value a) where
     type Unwrapped (Value a) = a
@@ -249,8 +265,9 @@ instance (WrappedValues a, WrappedValues b, WrappedValues c) => WrappedValues (a
     type Unwrapped (a, b, c) = (Unwrapped a, Unwrapped b, Unwrapped c)
     unwrapValues (a, b, c) = (unwrapValues a, unwrapValues b, unwrapValues c)
 
-
-
+-- | Convenience function for unwrapping an Entity and supplying both the key and value to another function.
+onEntity :: (Key a -> a -> b) -> Entity a -> b
+onEntity f (Entity x y) = f x y
 
 {- The following footnote and toc functions were used our pre-wiki about page
 At the time of this comment, they are no longer used anywhere live. -}
@@ -299,3 +316,49 @@ tocTarget tag title =
             <a .toc_target name="toc_target#{tag}" href="#toc_entry#{tag}" title="Back to Table Of Contents">
                 ^
     |]
+
+--------------------------------------------------------------------------------
+-- Utility functions
+
+lookupParamDefault :: Read a => Text -> a -> Handler a
+lookupParamDefault name def = do
+    maybe_param <- lookup name <$> reqGetParams <$> getRequest
+    return $ fromMaybe def $ do
+        param_str <- maybe_param
+        param <- listToMaybe $ reads $ T.unpack param_str
+        return $ fst param
+
+
+getLanguages :: Handler [Language]
+getLanguages = cached $ mapMaybe fromPathPiece <$> languages
+
+
+makeLanguageOptions :: Handler (OptionList Language)
+makeLanguageOptions = do
+    preferred_languages <- getLanguages
+    return $ OptionList
+        { olOptions = map mkOption $ preferred_languages ++ ([minBound..maxBound] \\ preferred_languages)
+        , olReadExternal = fromPathPiece
+        }
+  where
+    mkOption language = Option
+        { optionDisplay = toPathPiece language
+        , optionInternalValue = language
+        , optionExternalValue = toPathPiece language
+        }
+
+languagePreferenceOrder :: [Language] -> (a -> Language) -> a -> a -> Ordering
+languagePreferenceOrder langs getLang = flip compare `on` (flip lookup (zip (reverse langs) [1 :: Integer ..]) . getLang)
+
+pickTargetsByLanguage :: [Language] -> [Entity WikiTarget] -> [Entity WikiTarget]
+pickTargetsByLanguage langs targets =
+    let target_map = M.fromListWith (++) $ map (wikiTargetPage . entityVal &&& (:[])) targets
+     in M.elems $ M.mapMaybe (listToMaybe . sortBy (languagePreferenceOrder langs (wikiTargetLanguage . entityVal))) target_map
+
+pickEditsByLanguage :: [Language] -> [Entity WikiEdit] -> [Entity WikiEdit]
+pickEditsByLanguage langs targets =
+    let target_map = M.fromListWith (++) $ map (wikiEditPage . entityVal &&& (:[])) targets
+     in M.elems $ M.mapMaybe (listToMaybe . sortBy (languagePreferenceOrder langs (wikiEditLanguage . entityVal))) target_map
+
+--------------------------------------------------------------------------------
+-- /

@@ -1,194 +1,242 @@
-{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE TupleSections, OverloadedStrings #-}
 
 module Handler.Project where
 
 import Import
 
+import Data.Filter
+import Data.Order
+import Data.Time.Format
+import Handler.Comment
+import Handler.Discussion
+import Handler.Utils
+import Model.Application
+import Model.Blog
+import Model.Comment
+import Model.Comment.ActionPermissions
+import Model.Comment.HandlerInfo
+import Model.Comment.Mods
+import Model.Comment.Sql
 import Model.Currency
-import Model.Project
-import Model.Shares
+import Model.Discussion
+import Model.Issue
+import Model.Markdown
 import Model.Markdown.Diff
+import Model.Project
+import Model.Role
+import Model.Shares
+import Model.SnowdriftEvent
 import Model.User
-
-import qualified Data.List as L
-import qualified Data.Map as M
-import qualified Data.Text as T
-import qualified Data.Set as S
-
-import Data.Maybe (maybeToList)
-
-import Widgets.Markdown
+import Model.Wiki
+import System.Locale (defaultTimeLocale)
+import View.Comment
+import View.PledgeButton
+import View.Project
+import View.SnowdriftEvent
 import Widgets.Preview
 import Widgets.Time
 
-import Model.Markdown
-
 import Yesod.Markdown
 
-import Data.Time.Clock
+import           Data.Default   (def)
+import qualified Data.Foldable  as F
+import           Data.List      (sortBy)
+import qualified Data.Map       as M
+import           Data.Maybe     (maybeToList)
+import qualified Data.Set       as S
+import qualified Data.Text      as T
+import           Data.Tree      (Forest, Tree)
+import qualified Data.Tree      as Tree
+import           System.Random  (randomIO)
+import           Text.Cassius   (cassiusFile)
+import           Text.Printf
+import           Yesod.AtomFeed
+import           Yesod.RssFeed
+
+
+--------------------------------------------------------------------------------
+-- Utility functions
 
 lookupGetParamDefault :: Read a => Text -> a -> Handler a
-lookupGetParamDefault name def = do
+lookupGetParamDefault name def_val = do
     maybe_value <- lookupGetParam name
-    return $ fromMaybe def $ maybe_value >>= readMaybe . T.unpack
+    return (fromMaybe def_val (maybe_value >>= readMaybe . T.unpack))
 
+-- | Require any of the given Roles, failing with permissionDenied if none are satisfied.
+requireRolesAny :: [Role] -> Text -> Text -> Handler (UserId, Entity Project)
+requireRolesAny roles project_handle err_msg = do
+    user_id <- requireAuthId
+
+    (project, ok) <- runYDB $ do
+        project@(Entity project_id _) <- getBy404 (UniqueProjectHandle project_handle)
+
+        ok <- userHasRolesAnyDB roles user_id project_id
+
+        return (project, ok)
+
+    unless ok $
+        permissionDenied err_msg
+
+    return (user_id, project)
+
+-- | Sanity check for Project Comment pages. Redirects if the comment was rethreaded.
+-- 404's if the comment doesn't exist. 403 if permission denied.
+checkComment :: Text -> CommentId -> Handler (Maybe (Entity User), Entity Project, Comment)
+checkComment project_handle comment_id = do
+    muser <- maybeAuth
+    (project, comment) <- checkComment' (entityKey <$> muser) project_handle comment_id
+    return (muser, project, comment)
+
+-- | Like checkComment, but authentication is required.
+checkCommentRequireAuth :: Text -> CommentId -> Handler (Entity User, Entity Project, Comment)
+checkCommentRequireAuth project_handle comment_id = do
+    user@(Entity user_id _) <- requireAuth
+    (project, comment) <- checkComment' (Just user_id) project_handle comment_id
+    return (user, project, comment)
+
+-- | Abstract checkComment and checkCommentRequireAuth. You shouldn't use this function directly.
+checkComment' :: Maybe UserId -> Text -> CommentId -> Handler (Entity Project, Comment)
+checkComment' muser_id project_handle comment_id = do
+    redirectIfRethreaded comment_id
+
+    (project, ecomment) <- runYDB $ do
+        project@(Entity project_id _) <- getBy404 (UniqueProjectHandle project_handle)
+        let has_permission = exprCommentProjectPermissionFilter muser_id (val project_id)
+        ecomment <- fetchCommentDB comment_id has_permission
+        return (project, ecomment)
+
+    case ecomment of
+        Left CommentNotFound         -> notFound
+        Left CommentPermissionDenied -> permissionDenied "You don't have permission to view this comment."
+        Right comment                ->
+            if commentDiscussion comment /= projectDiscussion (entityVal project)
+                then notFound
+                else return (project, comment)
+
+checkProjectCommentActionPermission
+        :: (CommentActionPermissions -> Bool)
+        -> Entity User
+        -> Text
+        -> Entity Comment
+        -> Handler ()
+checkProjectCommentActionPermission
+        can_perform_action
+        user
+        project_handle
+        comment@(Entity comment_id _) = do
+    action_permissions <-
+        lookupErr "checkProjectCommentActionPermission: comment id not found in map" comment_id
+          <$> makeProjectCommentActionPermissionsMap (Just user) project_handle def [comment]
+    unless (can_perform_action action_permissions)
+           (permissionDenied "You don't have permission to perform this action.")
+
+makeProjectCommentForestWidget
+        :: Maybe (Entity User)
+        -> ProjectId
+        -> Text
+        -> [Entity Comment]
+        -> CommentMods
+        -> Handler MaxDepth
+        -> Bool
+        -> Widget
+        -> Handler (Widget, Forest (Entity Comment))
+makeProjectCommentForestWidget
+        muser
+        project_id
+        project_handle
+        comments
+        comment_mods
+        get_max_depth
+        is_preview
+        widget_under_root_comment = do
+    makeCommentForestWidget
+      (projectCommentHandlerInfo muser project_id project_handle)
+      comments
+      muser
+      comment_mods
+      get_max_depth
+      is_preview
+      widget_under_root_comment
+
+makeProjectCommentTreeWidget
+        :: Maybe (Entity User)
+        -> ProjectId
+        -> Text
+        -> Entity Comment
+        -> CommentMods
+        -> Handler MaxDepth
+        -> Bool
+        -> Widget
+        -> Handler (Widget, Tree (Entity Comment))
+makeProjectCommentTreeWidget a b c d e f g h = do
+    (widget, [tree]) <- makeProjectCommentForestWidget a b c [d] e f g h
+    return (widget, tree)
+
+makeProjectCommentActionWidget
+        :: MakeCommentActionWidget
+        -> Text
+        -> CommentId
+        -> CommentMods
+        -> Handler MaxDepth
+        -> Handler (Widget, Tree (Entity Comment))
+makeProjectCommentActionWidget make_comment_action_widget project_handle comment_id mods get_max_depth = do
+    (user, Entity project_id _, comment) <- checkCommentRequireAuth project_handle comment_id
+    make_comment_action_widget
+      (Entity comment_id comment)
+      user
+      (projectCommentHandlerInfo (Just user) project_id project_handle)
+      mods
+      get_max_depth
+      False
+
+projectDiscussionPage :: Text -> Widget -> Widget
+projectDiscussionPage project_handle widget = do
+    $(widgetFile "project_discussion_wrapper")
+    toWidget $(cassiusFile "templates/comment.cassius")
+
+-------------------------------------------------------------------------------
+--
 
 getProjectsR :: Handler Html
 getProjectsR = do
-    page <- lookupGetParamDefault "page" (0 :: Integer)
-    per_page <- lookupGetParamDefault "count" (20 :: Integer)
-    tags <- maybe [] (map T.strip . T.splitOn ",") <$> lookupGetParam "tags"
-    muser <- maybeAuth
-{-
-    projects <- runDB $ if null tags
-        then selectList [] [ Asc ProjectCreatedTs, LimitTo per_page, OffsetBy page ]
-        else do
-            tagged_projects <- forM tags $ \ name -> select $ from $ \ (t `InnerJoin` p_t) -> do
-                on_ (t ^. TagId ==. p_t ^. ProjectTagTag)
-                where_ ( t ^. TagName ==. val name )
-                return p_t
-
-            let project_ids = if null tagged_projects then S.empty else foldl1 S.intersection $ map (S.fromList . map (projectTagProject . entityVal)) tagged_projects
-            selectList [ ProjectId <-. S.toList project_ids ] [ Asc ProjectCreatedTs, LimitTo per_page, OffsetBy page ]
--}
-
-    projects <- runDB $ select $ from return
-
-    counts <- runDB $ maybe (const $ return []) getCounts muser projects
-
-    let counts' = M.fromList $ zip (map entityKey projects) counts
-
+    projects <- runDB fetchPublicProjectsDB
     defaultLayout $ do
         setTitle "Projects | Snowdrift.coop"
         $(widgetFile "projects")
 
+--------------------------------------------------------------------------------
+-- /
+
 getProjectR :: Text -> Handler Html
 getProjectR project_handle = do
-    maybe_viewer_id <- maybeAuthId
+    mviewer_id <- maybeAuthId
 
-    (project, pledges, pledge) <- runDB $ do
+    (project_id, project, pledges, pledge) <- runYDB $ do
         Entity project_id project <- getBy404 $ UniqueProjectHandle project_handle
         pledges <- getProjectShares project_id
-        pledge <- case maybe_viewer_id of
+        pledge <- case mviewer_id of
             Nothing -> return Nothing
             Just viewer_id -> getBy $ UniquePledge viewer_id project_id
 
-        return (project, pledges, pledge)
+        return (project_id, project, pledges, pledge)
 
     defaultLayout $ do
         setTitle . toHtml $ projectName project <> " | Snowdrift.coop"
-        renderProject (Just project_handle) project True pledges pledge
-
-
-renderProject :: Maybe Text
-                 -> Project
-                 -> Bool
-                 -> [Int64]
-                 -> Maybe (Entity Pledge)
-                 -> WidgetT App IO ()
-renderProject maybe_project_handle project show_form pledges pledge = do
-    let share_value = projectShareValue project
-        users = fromIntegral $ length pledges
-        shares = sum pledges
-        project_value = share_value $* fromIntegral shares
-        description = markdownWidget (fromMaybe "???" maybe_project_handle) $ projectDescription project
-
-        maybe_shares = pledgeShares . entityVal <$> pledge
-
-    now <- liftIO getCurrentTime
-
-    amounts <- case projectLastPayday project of
-        Nothing -> return Nothing
-        Just last_payday -> handlerToWidget $ runDB $ do
-            [Value (Just last) :: Value (Maybe Rational)] <- select $ from $ \ transaction -> do
-                where_ $ transaction ^. TransactionPayday ==. val (Just last_payday)
-                        &&. transaction ^. TransactionCredit ==. val (Just $ projectAccount project)
-
-                return $ sum_ $ transaction ^. TransactionAmount
-
-            [Value (Just year) :: Value (Maybe Rational)] <- select $ from $ \ (transaction `InnerJoin` payday) -> do
-                where_ $ payday ^. PaydayDate >. val (addUTCTime (-365 * 24 * 60 * 60) now)
-                        &&. transaction ^. TransactionCredit ==. val (Just $ projectAccount project)
-
-                on_ $ transaction ^. TransactionPayday ==. just (payday ^. PaydayId)
-
-                return $ sum_ $ transaction ^. TransactionAmount
-
-            [Value (Just total) :: Value (Maybe Rational)] <- select $ from $ \ transaction -> do
-                where_ $ transaction ^. TransactionCredit ==. val (Just $ projectAccount project)
-
-                return $ sum_ $ transaction ^. TransactionAmount
-
-
-            return $ Just (Milray $ round last, Milray $ round year, Milray $ round total)
-
-    let form = if show_form then pledgeForm else previewPledgeForm
-
-    ((_, update_shares), _) <- handlerToWidget $ generateFormGet $ form $ fromMaybe 0 maybe_shares
-
-    $(widgetFile "project")
-
-
-data UpdateProject = UpdateProject { updateProjectName :: Text, updateProjectDescription :: Markdown, updateProjectTags :: [Text], updateProjectGithubRepo :: Maybe Text } deriving Show
-
-
-editProjectForm :: Maybe (Project, [Text]) -> Form UpdateProject
-editProjectForm project =
-    renderBootstrap3 $ UpdateProject
-        <$> areq' textField "Project Name" (projectName . fst <$> project)
-        <*> areq' snowdriftMarkdownField "Description" (projectDescription . fst <$> project)
-        <*> (maybe [] (map T.strip . T.splitOn ",") <$> aopt' textField "Tags" (Just . T.intercalate ", " . snd <$> project))
-        <*> aopt' textField "Github Repository" (projectGithubRepo . fst <$> project)
-
-
-getEditProjectR :: Text -> Handler Html
-getEditProjectR project_handle = do
-    viewer_id <- requireAuthId
-
-    Entity project_id project <- runDB $ do
-        can_edit <- (||) <$> isProjectAdmin project_handle viewer_id <*> isProjectAdmin "snowdrift" viewer_id
-        if can_edit
-         then getBy404 $ UniqueProjectHandle project_handle
-         else permissionDenied "You do not have permission to edit this project."
-
-    tags <- runDB $ select $ from $ \ (p_t `InnerJoin` tag) -> do
-        on_ (p_t ^. ProjectTagTag ==. tag ^. TagId)
-        where_ (p_t ^. ProjectTagProject ==. val project_id)
-        return tag
-
-    (project_form, _) <- generateFormPost $ editProjectForm (Just (project, map (tagName . entityVal) tags))
-
-    defaultLayout $ do
-        setTitle . toHtml $ projectName project <> " | Snowdrift.coop"
-        $(widgetFile "edit_project")
-
+        renderProject (Just project_id) project pledges pledge
 
 postProjectR :: Text -> Handler Html
 postProjectR project_handle = do
-    viewer_id <- requireAuthId
-
-    Entity project_id project <- runDB $ do
-        can_edit <- (||) <$> isProjectAdmin project_handle viewer_id <*> isProjectAdmin "snowdrift" viewer_id
-        if can_edit
-         then getBy404 $ UniqueProjectHandle project_handle
-         else permissionDenied "You do not have permission to edit this project."
+    (viewer_id, Entity project_id project) <-
+        requireRolesAny [Admin] project_handle "You do not have permission to edit this project."
 
     ((result, _), _) <- runFormPost $ editProjectForm Nothing
 
     now <- liftIO getCurrentTime
 
     case result of
-        FormSuccess (UpdateProject name description tags github_repo) -> do
-            mode <- lookupPostParam "mode"
-            let action :: Text = "update"
-            case mode of
-                Just "preview" -> do
-                    let preview_project = project { projectName = name, projectDescription = description, projectGithubRepo = github_repo }
-
-                    (form, _) <- generateFormPost $ editProjectForm (Just (preview_project, tags))
-                    defaultLayout $ renderPreview form action $ renderProject (Just project_handle) preview_project False [] Nothing
-
-                Just x | x == action -> do
+        FormSuccess (UpdateProject name description tags github_repo) ->
+            lookupPostMode >>= \case
+                Just PostMode -> do
                     runDB $ do
                         when (projectDescription project /= description) $ do
                             project_update <- insert $ ProjectUpdate now project_id viewer_id $ diffMarkdown (projectDescription project) description
@@ -211,20 +259,862 @@ postProjectR project_handle = do
                                 Entity tag_id _ : _ -> return tag_id
 
 
-                        delete $ from $ \ project_tag -> where_ (project_tag ^. ProjectTagProject ==. val project_id)
+                        delete $
+                         from $ \pt ->
+                         where_ (pt ^. ProjectTagProject ==. val project_id)
 
-                        forM_ tag_ids $ \ tag_id -> insert $ ProjectTag project_id tag_id
+                        forM_ tag_ids $ \tag_id -> insert (ProjectTag project_id tag_id)
 
-                    addAlert "success" "project updated"
+                    alertSuccess "project updated"
                     redirect $ ProjectR project_handle
 
                 _ -> do
-                    addAlertEm "danger" "unrecognized mode" "Error: "
-                    redirect $ ProjectR project_handle
-        x -> do
-            addAlert "danger" $ T.pack $ show x
-            redirect $ ProjectR project_handle
+                    let preview_project = project { projectName = name, projectDescription = description, projectGithubRepo = github_repo }
 
+                    (form, _) <- generateFormPost $ editProjectForm (Just (preview_project, tags))
+                    defaultLayout $ previewWidget form "update" $ renderProject (Just project_id) preview_project [] Nothing
+
+        x -> do
+            alertDanger (T.pack $ show x)
+            redirect (ProjectR project_handle)
+
+--------------------------------------------------------------------------------
+-- /application
+
+getApplicationsR :: Text -> Handler Html
+getApplicationsR project_handle = do
+    viewer_id <- requireAuthId
+
+    (project, applications) <- runYDB $ do
+        Entity project_id project <- getBy404 (UniqueProjectHandle project_handle)
+        ok <- userIsAffiliatedWithProjectDB viewer_id project_id
+        unless ok $
+            lift (permissionDenied "You don't have permission to view this page.")
+
+        applications <- fetchProjectVolunteerApplicationsDB project_id
+        userReadVolunteerApplicationsDB viewer_id
+        return (project, applications)
+
+    defaultLayout $ do
+        setTitle . toHtml $ projectName project <> " Volunteer Applications | Snowdrift.coop"
+        $(widgetFile "applications")
+
+getApplicationR :: Text -> VolunteerApplicationId -> Handler Html
+getApplicationR project_handle application_id = do
+    viewer_id <- requireAuthId
+    (project, user, application, interests, num_interests) <- runYDB $ do
+        Entity project_id project <- getBy404 (UniqueProjectHandle project_handle)
+        ok <- userIsAffiliatedWithProjectDB viewer_id project_id
+        unless ok $
+            lift (permissionDenied "You don't have permission to view this page.")
+
+        application <- get404 application_id
+        let user_id = volunteerApplicationUser application
+        user <- get404 user_id
+        (interests, num_interests) <- (T.intercalate ", " &&& length) <$> fetchApplicationVolunteerInterestsDB application_id
+        return (project, Entity user_id user, application, interests, num_interests)
+
+    defaultLayout $ do
+        setTitle . toHtml $ projectName project <> " Volunteer Application - " <> userDisplayName user <> " | Snowdrift.coop"
+        $(widgetFile "application")
+
+--------------------------------------------------------------------------------
+-- /button.png
+
+getProjectPledgeButtonR :: Text -> Handler TypedContent
+getProjectPledgeButtonR project_handle = do
+   pledges <- runYDB $ do
+        Entity project_id _project <- getBy404 $ UniqueProjectHandle project_handle
+        getProjectShares project_id
+
+   let png = overlayImage blankPledgeButton $
+        fillInPledgeCount (fromIntegral (length pledges))
+
+   respond "image/png" png
+
+--------------------------------------------------------------------------------
+-- /b
+
+getProjectBlogR :: Text -> Handler Html
+getProjectBlogR project_handle = do
+    maybe_from <- fmap (Key . PersistInt64 . read . T.unpack) <$> lookupGetParam "from"
+    post_count <- fromMaybe 10 <$> fmap (read . T.unpack) <$> lookupGetParam "from"
+    Entity project_id project <- runYDB $ getBy404 $ UniqueProjectHandle project_handle
+
+    let apply_offset blog = maybe id (\ from_blog rest -> blog ^. BlogPostId >=. val from_blog &&. rest) maybe_from
+
+    (posts, next) <- fmap (splitAt post_count) $ runDB $
+        select $
+        from $ \blog -> do
+        where_ $ apply_offset blog $ blog ^. BlogPostProject ==. val project_id
+        orderBy [ desc $ blog ^. BlogPostTs, desc $ blog ^. BlogPostId ]
+        limit (fromIntegral post_count + 1)
+        return blog
+
+    renderRouteParams <- getUrlRenderParams
+
+    let nextRoute next_id = renderRouteParams (ProjectBlogR project_handle) [("from", toPathPiece next_id)]
+        discussion = DiscussionOnProject $ Entity project_id project
+
+    defaultLayout $ do
+        setTitle . toHtml $ projectName project <> " Blog | Snowdrift.coop"
+
+        $(widgetFile "project_blog")
+
+
+getNewProjectBlogPostR :: Text -> Handler Html
+getNewProjectBlogPostR project_handle = do
+    (_, Entity _ project) <- requireRolesAny [Admin, TeamMember] project_handle "You do not have permission to post to this project's blog."
+
+    (blog_form, _) <- generateFormPost $ projectBlogForm Nothing
+
+    defaultLayout $ do
+        setTitle . toHtml $ "Post To " <> projectName project <> " Blog | Snowdrift.coop"
+
+        $(widgetFile "new_blog_post")
+
+
+postNewProjectBlogPostR :: Text -> Handler Html
+postNewProjectBlogPostR project_handle = do
+    (viewer_id, Entity project_id _) <-
+        requireRolesAny [Admin, TeamMember] project_handle "You do not have permission to post to this project's blog."
+
+    now <- liftIO getCurrentTime
+
+    ((result, _), _) <- runFormPost $ projectBlogForm Nothing
+
+    case result of
+        FormSuccess (title, handle, Markdown content) -> do
+            lookupPostMode >>= \case
+                Just PostMode -> do
+                    void $ runSDB $ postBlogPostDB title handle viewer_id project_id (Markdown content)
+                    alertSuccess "posted"
+                    redirect $ ProjectBlogR project_handle
+
+                _ -> do
+
+                    let (top_content', bottom_content') = break (== "***") $ T.lines content
+                        top_content = T.unlines top_content'
+                        bottom_content = if bottom_content' == [] then Nothing else Just (Markdown $ T.unlines bottom_content')
+                        blog_post = BlogPost now title handle viewer_id project_id (Key $ PersistInt64 0) (Markdown top_content) bottom_content
+
+                    (form, _) <- generateFormPost $ projectBlogForm $ Just (title, handle, Markdown content)
+
+                    defaultLayout $ previewWidget form "post" $ renderBlogPost project_handle blog_post
+
+        x -> do
+            alertDanger $ T.pack $ show x
+            redirect $ NewProjectBlogPostR project_handle
+
+
+getProjectBlogPostR :: Text -> Text -> Handler Html
+getProjectBlogPostR project_handle blog_post_handle = do
+    (project, blog_post) <- runYDB $ do
+        Entity project_id project <- getBy404 $ UniqueProjectHandle project_handle
+        Entity _ blog_post <- getBy404 $ UniqueBlogPost project_id blog_post_handle
+
+        return (project, blog_post)
+
+    defaultLayout $ do
+        setTitle . toHtml $ projectName project <> " Blog - " <> blogPostTitle blog_post <> " | Snowdrift.coop"
+
+        renderBlogPost project_handle blog_post
+
+--------------------------------------------------------------------------------
+-- /c/#CommentId
+
+getProjectCommentR :: Text -> CommentId -> Handler Html
+getProjectCommentR project_handle comment_id = do
+    (muser, Entity project_id _, comment) <- checkComment project_handle comment_id
+    (widget, comment_tree) <-
+        makeProjectCommentTreeWidget
+          muser
+          project_id
+          project_handle
+          (Entity comment_id comment)
+          def
+          getMaxDepth
+          False
+          mempty
+
+    case muser of
+        Nothing -> return ()
+        Just (Entity user_id _) ->
+            runDB (userMaybeViewProjectCommentsDB user_id project_id (map entityKey (Tree.flatten comment_tree)))
+
+    defaultLayout (projectDiscussionPage project_handle widget)
+
+--------------------------------------------------------------------------------
+-- /c/#CommentId/approve
+
+getApproveProjectCommentR :: Text -> CommentId -> Handler Html
+getApproveProjectCommentR project_handle comment_id = do
+    (widget, _) <-
+        makeProjectCommentActionWidget
+          makeApproveCommentWidget
+          project_handle
+          comment_id
+          def
+          getMaxDepth
+    defaultLayout (projectDiscussionPage project_handle widget)
+
+postApproveProjectCommentR :: Text -> CommentId -> Handler Html
+postApproveProjectCommentR project_handle comment_id = do
+    (user@(Entity user_id _), _, comment) <- checkCommentRequireAuth project_handle comment_id
+    checkProjectCommentActionPermission can_approve user project_handle (Entity comment_id comment)
+
+    postApproveComment user_id comment_id comment
+    redirect (ProjectCommentR project_handle comment_id)
+
+--------------------------------------------------------------------------------
+-- /c/#CommentId/claim
+
+getClaimProjectCommentR :: Text -> CommentId -> Handler Html
+getClaimProjectCommentR project_handle comment_id = do
+    (widget, _) <-
+        makeProjectCommentActionWidget
+          makeClaimCommentWidget
+          project_handle
+          comment_id
+          def
+          getMaxDepth
+    defaultLayout (projectDiscussionPage project_handle widget)
+
+postClaimProjectCommentR :: Text -> CommentId -> Handler Html
+postClaimProjectCommentR project_handle comment_id = do
+    (user, (Entity project_id _), comment) <- checkCommentRequireAuth project_handle comment_id
+    checkProjectCommentActionPermission can_claim user project_handle (Entity comment_id comment)
+
+    postClaimComment
+      user
+      comment_id
+      comment
+      (projectCommentHandlerInfo (Just user) project_id project_handle)
+      >>= \case
+        Nothing -> redirect (ProjectCommentR project_handle comment_id)
+        Just (widget, form) -> defaultLayout $ previewWidget form "claim" (projectDiscussionPage project_handle widget)
+
+--------------------------------------------------------------------------------
+-- /c/#CommentId/close
+
+getCloseProjectCommentR :: Text -> CommentId -> Handler Html
+getCloseProjectCommentR project_handle comment_id = do
+    (widget, _) <-
+        makeProjectCommentActionWidget
+          makeCloseCommentWidget
+          project_handle
+          comment_id
+          def
+          getMaxDepth
+    defaultLayout (projectDiscussionPage project_handle widget)
+
+
+postCloseProjectCommentR :: Text -> CommentId -> Handler Html
+postCloseProjectCommentR project_handle comment_id = do
+    (user, (Entity project_id _), comment) <- checkCommentRequireAuth project_handle comment_id
+    checkProjectCommentActionPermission can_close user project_handle (Entity comment_id comment)
+
+    postCloseComment
+      user
+      comment_id
+      comment
+      (projectCommentHandlerInfo (Just user) project_id project_handle)
+      >>= \case
+        Nothing -> redirect (ProjectCommentR project_handle comment_id)
+        Just (widget, form) -> defaultLayout $ previewWidget form "close" (projectDiscussionPage project_handle widget)
+
+--------------------------------------------------------------------------------
+-- /c/#CommentId/delete
+
+getDeleteProjectCommentR :: Text -> CommentId -> Handler Html
+getDeleteProjectCommentR project_handle comment_id = do
+    (widget, _) <-
+        makeProjectCommentActionWidget
+          makeDeleteCommentWidget
+          project_handle
+          comment_id
+          def
+          getMaxDepth
+    defaultLayout (projectDiscussionPage project_handle widget)
+
+postDeleteProjectCommentR :: Text -> CommentId -> Handler Html
+postDeleteProjectCommentR project_handle comment_id = do
+    (user, _, comment) <- checkCommentRequireAuth project_handle comment_id
+    checkProjectCommentActionPermission can_delete user project_handle (Entity comment_id comment)
+
+    was_deleted <- postDeleteComment comment_id
+    if was_deleted
+        then redirect (ProjectDiscussionR project_handle)
+        else redirect (ProjectCommentR project_handle comment_id)
+
+--------------------------------------------------------------------------------
+-- /c/#CommentId/edit
+
+getEditProjectCommentR :: Text -> CommentId -> Handler Html
+getEditProjectCommentR project_handle comment_id = do
+    (widget, _) <-
+        makeProjectCommentActionWidget
+          makeEditCommentWidget
+          project_handle
+          comment_id
+          def
+          getMaxDepth
+    defaultLayout (projectDiscussionPage project_handle widget)
+
+postEditProjectCommentR :: Text -> CommentId -> Handler Html
+postEditProjectCommentR project_handle comment_id = do
+    (user, Entity project_id _, comment) <- checkCommentRequireAuth project_handle comment_id
+    checkProjectCommentActionPermission can_edit user project_handle (Entity comment_id comment)
+
+    postEditComment
+      user
+      (Entity comment_id comment)
+      (projectCommentHandlerInfo (Just user) project_id project_handle)
+      >>= \case
+        Nothing -> redirect (ProjectCommentR project_handle comment_id)         -- Edit made.
+        Just (widget, form) -> defaultLayout $ previewWidget form "post" (projectDiscussionPage project_handle widget)
+
+--------------------------------------------------------------------------------
+-- /c/#CommentId/flag
+
+getFlagProjectCommentR :: Text -> CommentId -> Handler Html
+getFlagProjectCommentR project_handle comment_id = do
+    (widget, _) <-
+        makeProjectCommentActionWidget
+          makeFlagCommentWidget
+          project_handle
+          comment_id
+          def
+          getMaxDepth
+    defaultLayout (projectDiscussionPage project_handle widget)
+
+postFlagProjectCommentR :: Text -> CommentId -> Handler Html
+postFlagProjectCommentR project_handle comment_id = do
+    (user, Entity project_id _, comment) <- checkCommentRequireAuth project_handle comment_id
+    checkProjectCommentActionPermission can_flag user project_handle (Entity comment_id comment)
+
+    postFlagComment
+      user
+      (Entity comment_id comment)
+      (projectCommentHandlerInfo (Just user) project_id project_handle)
+      >>= \case
+        Nothing -> redirect (ProjectDiscussionR project_handle)
+        Just (widget, form) -> defaultLayout $ previewWidget form "flag" (projectDiscussionPage project_handle widget)
+
+--------------------------------------------------------------------------------
+-- /c/#CommentId/reply
+
+getReplyProjectCommentR :: Text -> CommentId -> Handler Html
+getReplyProjectCommentR project_handle parent_id = do
+    (widget, _) <-
+        makeProjectCommentActionWidget
+          makeReplyCommentWidget
+          project_handle
+          parent_id
+          def
+          getMaxDepth
+    defaultLayout (projectDiscussionPage project_handle widget)
+
+postReplyProjectCommentR :: Text -> CommentId -> Handler Html
+postReplyProjectCommentR project_handle parent_id = do
+    (user, Entity _ project, parent) <- checkCommentRequireAuth project_handle parent_id
+    checkProjectCommentActionPermission can_reply user project_handle (Entity parent_id parent)
+
+    postNewComment
+      (Just parent_id)
+      user
+      (projectDiscussion project)
+      (makeProjectCommentActionPermissionsMap (Just user) project_handle def) >>= \case
+        Left _ -> redirect (ProjectCommentR project_handle parent_id)
+        Right (widget, form) -> defaultLayout $ previewWidget form "post" (projectDiscussionPage project_handle widget)
+
+--------------------------------------------------------------------------------
+-- /c/#CommentId/rethread
+
+getRethreadProjectCommentR :: Text -> CommentId -> Handler Html
+getRethreadProjectCommentR project_handle comment_id = do
+    (widget, _) <-
+        makeProjectCommentActionWidget
+          makeRethreadCommentWidget
+          project_handle
+          comment_id
+          def
+          getMaxDepth
+    defaultLayout (projectDiscussionPage project_handle widget)
+
+postRethreadProjectCommentR :: Text -> CommentId -> Handler Html
+postRethreadProjectCommentR project_handle comment_id = do
+    (user@(Entity user_id _), _, comment) <- checkCommentRequireAuth project_handle comment_id
+    checkProjectCommentActionPermission can_rethread user project_handle (Entity comment_id comment)
+    postRethreadComment user_id comment_id comment
+
+--------------------------------------------------------------------------------
+-- /c/#CommentId/retract
+
+getRetractProjectCommentR :: Text -> CommentId -> Handler Html
+getRetractProjectCommentR project_handle comment_id = do
+    (widget, _) <-
+        makeProjectCommentActionWidget
+          makeRetractCommentWidget
+          project_handle
+          comment_id
+          def
+          getMaxDepth
+    defaultLayout (projectDiscussionPage project_handle widget)
+
+postRetractProjectCommentR :: Text -> CommentId -> Handler Html
+postRetractProjectCommentR project_handle comment_id = do
+    (user, Entity project_id _, comment) <- checkCommentRequireAuth project_handle comment_id
+    checkProjectCommentActionPermission can_retract user project_handle (Entity comment_id comment)
+
+    postRetractComment
+      user
+      comment_id
+      comment
+      (projectCommentHandlerInfo (Just user) project_id project_handle)
+      >>= \case
+        Nothing -> redirect (ProjectCommentR project_handle comment_id)
+        Just (widget, form) -> defaultLayout $ previewWidget form "retract" (projectDiscussionPage project_handle widget)
+
+--------------------------------------------------------------------------------
+-- /c/#CommentId/tags
+
+getProjectCommentTagsR :: Text -> CommentId -> Handler Html
+getProjectCommentTagsR _ = getCommentTags
+
+--------------------------------------------------------------------------------
+-- /c/#CommentId/tag/#TagId
+
+getProjectCommentTagR :: Text -> CommentId -> TagId -> Handler Html
+getProjectCommentTagR _ = getCommentTagR
+
+postProjectCommentTagR :: Text -> CommentId -> TagId -> Handler ()
+postProjectCommentTagR _ = postCommentTagR
+
+--------------------------------------------------------------------------------
+-- /c/#CommentId/tag/apply, /c/#CommentId/tag/create
+
+postProjectCommentApplyTagR, postProjectCommentCreateTagR:: Text -> CommentId -> Handler Html
+postProjectCommentApplyTagR  = applyOrCreate postCommentApplyTag
+postProjectCommentCreateTagR = applyOrCreate postCommentCreateTag
+
+applyOrCreate :: (CommentId -> Handler ()) -> Text -> CommentId -> Handler Html
+applyOrCreate action project_handle comment_id = do
+    action comment_id
+    redirect (ProjectCommentR project_handle comment_id)
+
+--------------------------------------------------------------------------------
+-- /c/#CommentId/tag/new
+
+getProjectCommentAddTagR :: Text -> CommentId -> Handler Html
+getProjectCommentAddTagR project_handle comment_id = do
+    (user@(Entity user_id _), Entity project_id _, comment) <- checkCommentRequireAuth project_handle comment_id
+    checkProjectCommentActionPermission can_add_tag user project_handle (Entity comment_id comment)
+    getProjectCommentAddTag comment_id project_id user_id
+
+--------------------------------------------------------------------------------
+-- /c/#CommentId/unclaim
+
+getUnclaimProjectCommentR :: Text -> CommentId -> Handler Html
+getUnclaimProjectCommentR project_handle comment_id = do
+    (widget, _) <-
+        makeProjectCommentActionWidget
+          makeUnclaimCommentWidget
+          project_handle
+          comment_id
+          def
+          getMaxDepth
+    defaultLayout (projectDiscussionPage project_handle widget)
+
+postUnclaimProjectCommentR :: Text -> CommentId -> Handler Html
+postUnclaimProjectCommentR project_handle comment_id = do
+    (user, (Entity project_id _), comment) <- checkCommentRequireAuth project_handle comment_id
+    checkProjectCommentActionPermission can_unclaim user project_handle (Entity comment_id comment)
+
+    postUnclaimComment
+      user
+      comment_id
+      comment
+      (projectCommentHandlerInfo (Just user) project_id project_handle)
+      >>= \case
+        Nothing -> redirect (ProjectCommentR project_handle comment_id)
+        Just (widget, form) -> defaultLayout $ previewWidget form "unclaim" (projectDiscussionPage project_handle widget)
+
+--------------------------------------------------------------------------------
+-- /c/#CommentId/watch
+
+getWatchProjectCommentR :: Text -> CommentId -> Handler Html
+getWatchProjectCommentR project_handle comment_id = do
+    (widget, _) <-
+        makeProjectCommentActionWidget
+          makeWatchCommentWidget
+          project_handle
+          comment_id
+          def
+          getMaxDepth
+
+    defaultLayout (projectDiscussionPage project_handle widget)
+
+postWatchProjectCommentR ::Text -> CommentId -> Handler Html
+postWatchProjectCommentR project_handle comment_id = do
+    (viewer@(Entity viewer_id _), _, comment) <- checkCommentRequireAuth project_handle comment_id
+    checkProjectCommentActionPermission can_watch viewer project_handle (Entity comment_id comment)
+
+    postWatchComment viewer_id comment_id
+
+    redirect (ProjectCommentR project_handle comment_id)
+
+--------------------------------------------------------------------------------
+-- /c/#CommentId/unwatch
+
+getUnwatchProjectCommentR :: Text -> CommentId -> Handler Html
+getUnwatchProjectCommentR project_handle comment_id = do
+    (widget, _) <-
+        makeProjectCommentActionWidget
+          makeUnwatchCommentWidget
+          project_handle
+          comment_id
+          def
+          getMaxDepth
+
+    defaultLayout (projectDiscussionPage project_handle widget)
+
+postUnwatchProjectCommentR ::Text -> CommentId -> Handler Html
+postUnwatchProjectCommentR project_handle comment_id = do
+    (viewer@(Entity viewer_id _), _, comment) <- checkCommentRequireAuth project_handle comment_id
+    checkProjectCommentActionPermission can_watch viewer project_handle (Entity comment_id comment)
+
+    postUnwatchComment viewer_id comment_id
+
+    redirect (ProjectCommentR project_handle comment_id)
+
+--------------------------------------------------------------------------------
+-- /contact
+
+-- ProjectContactR stuff posts a private new topic to project discussion
+
+getProjectContactR :: Text -> Handler Html
+getProjectContactR project_handle = do
+    (project_contact_form, _) <- generateFormPost projectContactForm
+    Entity _ project <- runYDB $ getBy404 (UniqueProjectHandle project_handle)
+    defaultLayout $ do
+        setTitle . toHtml $ "Contact " <> projectName project <> " | Snowdrift.coop"
+        $(widgetFile "project_contact")
+
+postProjectContactR :: Text -> Handler Html
+postProjectContactR project_handle = do
+    maybe_user_id <- maybeAuthId
+
+    ((result, _), _) <- runFormPost projectContactForm
+
+    Entity _ project <- runYDB $ getBy404 (UniqueProjectHandle project_handle)
+
+    case result of
+        FormSuccess (content, language) -> do
+            _ <- runSDB (postApprovedCommentDB (fromMaybe anonymousUser maybe_user_id) Nothing (projectDiscussion project) content VisPrivate language)
+
+            alertSuccess "Comment submitted. Thank you for your input!"
+
+        _ -> alertDanger "Error occurred when submitting form."
+
+    redirect $ ProjectContactR project_handle
+
+--------------------------------------------------------------------------------
+-- /d
+
+getProjectDiscussionR :: Text -> Handler Html
+getProjectDiscussionR = getDiscussion . getProjectDiscussion
+
+getProjectDiscussion :: Text -> (DiscussionId -> ExprCommentCond -> DB [Entity Comment]) -> Handler Html
+getProjectDiscussion project_handle get_root_comments = do
+    muser <- maybeAuth
+    let muser_id = entityKey <$> muser
+
+    (Entity project_id project, root_comments) <- runYDB $ do
+        p@(Entity project_id project) <- getBy404 (UniqueProjectHandle project_handle)
+        let has_permission = exprCommentProjectPermissionFilter muser_id (val project_id)
+        root_comments <- get_root_comments (projectDiscussion project) has_permission
+        return (p, root_comments)
+
+    (comment_forest_no_css, _) <-
+        makeProjectCommentForestWidget
+          muser
+          project_id
+          project_handle
+          root_comments
+          def
+          getMaxDepth
+          False
+          mempty
+
+    let has_comments = not (null root_comments)
+        comment_forest = do
+            comment_forest_no_css
+            toWidget $(cassiusFile "templates/comment.cassius")
+
+    (comment_form, _) <- generateFormPost commentNewTopicForm
+
+    defaultLayout $ do
+        setTitle . toHtml $ projectName project <> " Discussion | Snowdrift.coop"
+        $(widgetFile "project_discuss")
+
+--------------------------------------------------------------------------------
+-- /d/new
+
+getNewProjectDiscussionR :: Text -> Handler Html
+getNewProjectDiscussionR project_handle = do
+    void requireAuth
+    let widget = commentNewTopicFormWidget
+    defaultLayout (projectDiscussionPage project_handle widget)
+
+postNewProjectDiscussionR :: Text -> Handler Html
+postNewProjectDiscussionR project_handle = do
+    user <- requireAuth
+    Entity _ Project{..} <- runYDB (getBy404 (UniqueProjectHandle project_handle))
+
+    postNewComment
+      Nothing
+      user
+      projectDiscussion
+      (makeProjectCommentActionPermissionsMap (Just user) project_handle def) >>= \case
+        Left comment_id -> redirect (ProjectCommentR project_handle comment_id)
+        Right (widget, form) -> defaultLayout $ previewWidget form "post" (projectDiscussionPage project_handle widget)
+
+--------------------------------------------------------------------------------
+-- /edit
+
+getEditProjectR :: Text -> Handler Html
+getEditProjectR project_handle = do
+    (_, Entity project_id project) <-
+        requireRolesAny [Admin] project_handle "You do not have permission to edit this project."
+
+    tags <- runDB $
+        select $
+        from $ \ (p_t `InnerJoin` tag) -> do
+        on_ (p_t ^. ProjectTagTag ==. tag ^. TagId)
+        where_ (p_t ^. ProjectTagProject ==. val project_id)
+        return tag
+
+    (project_form, _) <- generateFormPost $ editProjectForm (Just (project, map (tagName . entityVal) tags))
+
+    defaultLayout $ do
+        setTitle . toHtml $ projectName project <> " | Snowdrift.coop"
+        $(widgetFile "edit_project")
+
+--------------------------------------------------------------------------------
+-- /feed
+
+-- | This function is responsible for hitting every relevant event table. Nothing
+-- statically guarantees that.
+getProjectFeedR :: Text -> Handler TypedContent
+getProjectFeedR project_handle = do
+    let lim = 26 -- limit 'lim' from each table, then take 'lim - 1'
+
+    languages <- getLanguages
+
+    muser <- maybeAuth
+    let muser_id = entityKey <$> muser
+
+    before <- lookupGetUTCTimeDefaultNow "before"
+
+    (project, comments, rethreads, closings, claimings, unclaimings, wiki_pages, wiki_edits, blog_posts, new_pledges,
+     updated_pledges, deleted_pledges, discussion_map, wiki_target_map, user_map,
+     earlier_closures_map, earlier_retracts_map, closure_map, retract_map,
+     ticket_map, claim_map, flag_map) <- runYDB $ do
+
+        Entity project_id project <- getBy404 (UniqueProjectHandle project_handle)
+
+        comments        <- fetchProjectCommentsIncludingRethreadedBeforeDB    project_id muser_id before lim
+        rethreads       <- fetchProjectCommentRethreadsBeforeDB               project_id muser_id before lim
+        closings        <- fetchProjectCommentClosingsBeforeDB                project_id muser_id before lim
+        claimings       <- fetchProjectTicketClaimingsBeforeDB                project_id before lim
+        unclaimings     <- fetchProjectTicketUnclaimingsBeforeDB              project_id before lim
+        wiki_pages      <- fetchProjectWikiPagesWithTargetsBeforeDB languages project_id before lim
+        blog_posts      <- fetchProjectBlogPostsBeforeDB                      project_id before lim
+        wiki_edits      <- fetchProjectWikiEditsWithTargetsBeforeDB languages project_id before lim
+        new_pledges     <- fetchProjectNewPledgesBeforeDB                     project_id before lim
+        updated_pledges <- fetchProjectUpdatedPledgesBeforeDB                 project_id before lim
+        deleted_pledges <- fetchProjectDeletedPledgesBeforeDB                 project_id before lim
+
+        -- Suplementary maps for displaying the data. If something above requires extra
+        -- data to display the project feed row, it MUST be used to fetch the data below!
+
+        let (comment_ids, comment_users)       = F.foldMap (\c -> ([entityKey c], [commentUser (entityVal c)])) comments
+            (wiki_edit_users, wiki_edit_pages) = F.foldMap (\(Entity _ e, _) -> ([wikiEditUser e], [wikiEditPage e])) wiki_edits
+            (blog_post_users) = F.foldMap (\(Entity _ e) -> ([blogPostUser e])) blog_posts
+            shares_pledged                     = map entityVal (new_pledges <> (map snd updated_pledges))
+            -- All users: comment posters, wiki page creators, etc.
+            user_ids = S.toList $ mconcat
+                        [ S.fromList comment_users
+                        , S.fromList (map (commentClosingClosedBy . entityVal) closings)
+                        , S.fromList (map (rethreadModerator . entityVal) rethreads)
+                        , S.fromList wiki_edit_users
+                        , S.fromList blog_post_users
+                        , S.fromList (map (either (ticketClaimingUser . entityVal) (ticketOldClaimingUser . entityVal)) claimings)
+                        , S.fromList (map (ticketOldClaimingUser . entityVal) unclaimings)
+                        , S.fromList (map sharesPledgedUser shares_pledged)
+                        , S.fromList (map eventDeletedPledgeUser deleted_pledges)
+                        ]
+
+        discussion_map <- fetchProjectDiscussionsDB project_id >>= fetchDiscussionsDB languages
+
+        ticket_map <- fetchCommentTicketsDB $ mconcat
+            [ S.fromList comment_ids
+            , S.fromList $ map (either (ticketClaimingTicket . entityVal) (ticketOldClaimingTicket . entityVal)) claimings
+            , S.fromList $ map (ticketOldClaimingTicket . entityVal) unclaimings
+            ]
+
+        -- WikiPages keyed by their own IDs (contained in a WikiEdit)
+        wiki_targets <- pickTargetsByLanguage languages <$> fetchWikiPageTargetsInDB wiki_edit_pages
+        let wiki_target_map = M.fromList $ map ((wikiTargetPage &&& id) . entityVal) wiki_targets
+
+        user_map <- entitiesMap <$> fetchUsersInDB user_ids
+
+        earlier_closures_map <- fetchCommentsAncestorClosuresDB comment_ids
+        earlier_retracts_map <- fetchCommentsAncestorRetractsDB comment_ids
+        closure_map          <- makeCommentClosingMapDB         comment_ids
+        retract_map          <- makeCommentRetractingMapDB      comment_ids
+        claim_map            <- makeClaimedTicketMapDB          comment_ids
+        flag_map             <- makeFlagMapDB                   comment_ids
+
+        return (project, comments, rethreads, closings, claimings, unclaimings, wiki_pages, wiki_edits, blog_posts,
+                new_pledges, updated_pledges, deleted_pledges, discussion_map,
+                wiki_target_map, user_map, earlier_closures_map,
+                earlier_retracts_map, closure_map, retract_map, ticket_map,
+                claim_map, flag_map)
+
+    action_permissions_map <- makeProjectCommentActionPermissionsMap muser project_handle def comments
+
+
+    let all_unsorted_events = mconcat
+            [ map (onEntity ECommentPosted)      comments
+            , map (onEntity ECommentRethreaded)  rethreads
+            , map (onEntity ECommentClosed)      closings
+
+            , map (ETicketClaimed . either (Left . onEntity (,)) (Right . onEntity (,)))
+                                                 claimings
+
+            , map (onEntity ETicketUnclaimed)    unclaimings
+            , map (uncurry $ onEntity EWikiPage) wiki_pages
+            , map (uncurry $ onEntity EWikiEdit) wiki_edits
+            , map (onEntity EBlogPost)           blog_posts
+            , map (onEntity ENewPledge)          new_pledges
+            , map eup2se                         updated_pledges
+            , map edp2se                         deleted_pledges
+            ]
+
+        (events, more_events) = splitAt (lim-1) (sortBy snowdriftEventNewestToOldest all_unsorted_events)
+
+        -- For pagination: Nothing means no more pages, Just time means set the 'before'
+        -- GET param to that time. Note that this means 'before' should be a <= relation,
+        -- rather than a <.
+        mnext_before :: Maybe Text
+        mnext_before = case more_events of
+          []             -> Nothing
+          (next_event:_) -> (Just . T.pack . show . snowdriftEventTime) next_event
+
+    now        <- liftIO getCurrentTime
+    Just route <- getCurrentRoute
+    render     <- getUrlRender
+    let feed = Feed "project feed" route HomeR "Snowdrift Community" "" "en" now $
+            mapMaybe (snowdriftEventToFeedEntry
+                        render
+                        project_handle
+                        user_map
+                        discussion_map
+                        wiki_target_map
+                        ticket_map) events
+
+    selectRep $ do
+        provideRep $ atomFeed feed
+        provideRep $ rssFeed feed
+        provideRep $ defaultLayout $ do
+            $(widgetFile "project_feed")
+            toWidget $(cassiusFile "templates/comment.cassius")
+
+  where
+    -- "event updated pledge to snowdrift event"
+    eup2se :: (Int64, Entity SharesPledged) -> SnowdriftEvent
+    eup2se (old_shares, Entity shares_pledged_id shares_pledged) = EUpdatedPledge old_shares shares_pledged_id shares_pledged
+
+    -- "event deleted pledge to snowdrift event"
+    edp2se :: EventDeletedPledge -> SnowdriftEvent
+    edp2se (EventDeletedPledge a b c d) = EDeletedPledge a b c d
+
+--------------------------------------------------------------------------------
+-- /invite
+
+getInviteR :: Text -> Handler Html
+getInviteR project_handle = do
+    (_, Entity _ project) <- requireRolesAny [Admin] project_handle "You must be a project admin to invite."
+
+    now <- liftIO getCurrentTime
+    maybe_invite_code <- lookupSession "InviteCode"
+    maybe_invite_role <- fmap (read . T.unpack) <$> lookupSession "InviteRole"
+    deleteSession "InviteCode"
+    deleteSession "InviteRole"
+    let maybe_link = InvitationR project_handle <$> maybe_invite_code
+    (invite_form, _) <- generateFormPost inviteForm
+
+    outstanding_invites <- runDB $
+        select $
+        from $ \ invite -> do
+        where_ ( invite ^. InviteRedeemed ==. val False )
+        orderBy [ desc (invite ^. InviteCreatedTs) ]
+        return invite
+
+    redeemed_invites <- runDB $
+        select $
+        from $ \ invite -> do
+        where_ ( invite ^. InviteRedeemed ==. val True )
+        orderBy [ desc (invite ^. InviteCreatedTs) ]
+        limit 20
+        return invite
+
+    let redeemed_users = S.fromList $ mapMaybe (inviteRedeemedBy . entityVal) redeemed_invites
+        redeemed_inviters = S.fromList $ map (inviteUser . entityVal) redeemed_invites
+        outstanding_inviters = S.fromList $ map (inviteUser . entityVal) outstanding_invites
+        user_ids = S.toList $ redeemed_users `S.union` redeemed_inviters `S.union` outstanding_inviters
+
+    user_entities <- runDB $ selectList [ UserId <-. user_ids ] []
+
+    let users = M.fromList $ map (entityKey &&& id) user_entities
+
+    let format_user Nothing = "NULL"
+        format_user (Just user_id) =
+            let Entity _ user = fromMaybe (error "getInviteR: user_id not found in users map")
+                                          (M.lookup user_id users)
+             in fromMaybe (userIdent user) $ userName user
+
+        format_inviter user_id =
+            userDisplayName $ fromMaybe (error "getInviteR(#2): user_id not found in users map")
+                                        (M.lookup user_id users)
+
+    defaultLayout $ do
+        setTitle . toHtml $ projectName project <> " - Send Invite | Snowdrift.coop"
+        $(widgetFile "invite")
+
+postInviteR :: Text -> Handler Html
+postInviteR project_handle = do
+    (user_id, Entity project_id _) <- requireRolesAny [Admin] project_handle "You must be a project admin to invite."
+
+    now <- liftIO getCurrentTime
+    invite <- liftIO randomIO
+
+    ((result, _), _) <- runFormPost inviteForm
+    case result of
+        FormSuccess (tag, role) -> do
+            let invite_code = T.pack $ printf "%016x" (invite :: Int64)
+            _ <- runDB $ insert $ Invite now project_id invite_code user_id role tag False Nothing Nothing
+            setSession "InviteCode" invite_code
+            setSession "InviteRole" (T.pack $ show role)
+
+        _ -> alertDanger "Error in submitting form."
+
+    redirect $ InviteR project_handle
+
+--------------------------------------------------------------------------------
+-- /patrons
 
 getProjectPatronsR :: Text -> Handler Html
 getProjectPatronsR project_handle = do
@@ -233,7 +1123,7 @@ getProjectPatronsR project_handle = do
     page <- lookupGetParamDefault "page" 0
     per_page <- lookupGetParamDefault "count" 20
 
-    (project, pledges, user_payouts_map) <- runDB $ do
+    (project, pledges, user_payouts_map) <- runYDB $ do
         Entity project_id project <- getBy404 $ UniqueProjectHandle project_handle
         pledges <- select $ from $ \ (pledge `InnerJoin` user) -> do
             on_ $ pledge ^. PledgeUser ==. user ^. UserId
@@ -264,11 +1154,111 @@ getProjectPatronsR project_handle = do
         setTitle . toHtml $ projectName project <> " Patrons | Snowdrift.coop"
         $(widgetFile "project_patrons")
 
+--------------------------------------------------------------------------------
+-- shares
+
+getUpdateSharesR :: Text -> Handler Html
+getUpdateSharesR project_handle = do
+    _ <- requireAuthId
+    Entity project_id project <- runYDB $ getBy404 $ UniqueProjectHandle project_handle
+
+    ((result, _), _) <- runFormGet $ pledgeForm project_id
+    case result of
+        FormSuccess (SharesPurchaseOrder shares) -> do
+            -- TODO - refuse negative
+            user_id <- requireAuthId
+            (confirm_form, _) <- generateFormPost $ projectConfirmSharesForm (Just shares)
+
+            runDB (getBy (UniquePledge user_id project_id)) >>= \case
+                Just (Entity _ pledge) | pledgeShares pledge == shares -> do
+                    alertWarning ("Your pledge was already at " <> T.pack (show shares) <> " " <> plural shares "share" "shares" <> ". Thank you for your support!")
+                    redirect (ProjectR project_handle)
+                mpledge ->
+                    defaultLayout $ do
+                        setTitle . toHtml $ projectName project <> " - update pledge | Snowdrift.coop"
+                        $(widgetFile "update_shares")
+
+        FormMissing -> defaultLayout [whamlet| form missing |]
+        FormFailure _ -> defaultLayout [whamlet| form failure |]
+
+
+postUpdateSharesR :: Text -> Handler Html
+postUpdateSharesR project_handle = do
+    ((result, _), _) <- runFormPost $ projectConfirmSharesForm Nothing
+    isConfirmed <- maybe False (T.isPrefixOf "yes") <$> lookupPostParam "confirm"
+
+    case result of
+        FormSuccess (SharesPurchaseOrder shares) -> do
+            -- TODO - refuse negative
+
+            if isConfirmed
+                then do
+                    Just pledge_render_id <- fmap (read . T.unpack) <$> lookupSession pledgeRenderKey
+
+                    (success, project) <- runSYDB $ do
+                        Entity user_id user <- lift (lift requireAuth)
+                        Just account <- lift $ get (userAccount user)
+                        Entity project_id project <- lift $ getBy404 (UniqueProjectHandle project_handle)
+
+                        let user_outlay = projectShareValue project $* fromIntegral shares :: Milray
+                        if accountBalance account < user_outlay $* 3
+                            then return (False, project)
+                            else do
+                                insertProjectPledgeDB user_id project_id shares pledge_render_id
+                                lift (updateShareValue project_id)
+                                return (True, project)
+
+                    if success
+                        then do
+                            if shares == 0
+                                then alertSuccess ("You have dropped your pledge and are no longer " <>
+                                                "a patron of " <> projectName project <> ".")
+                                else alertSuccess ("Your pledge is now " <> T.pack (show shares) <> " " <> plural shares "share" "shares"
+                                        <> ". Thank you for being a patron of " <> projectName project <> "!")
+
+                        else alertWarning ("Sorry, you must have funds to support your pledge "
+                                    <> "for at least 3 months at current share value. "
+                                    <> "Please deposit additional funds to your account.")
+
+                    redirect (ProjectR project_handle)
+                else redirect (ProjectR project_handle)
+        _ -> do
+            alertDanger "error occurred in form submission"
+            redirect (UpdateSharesR project_handle)
+
+--------------------------------------------------------------------------------
+-- /t
+
+getTicketsR :: Text -> Handler Html
+getTicketsR project_handle = do
+    muser_id <- maybeAuthId
+    (project, tagged_tickets) <- runYDB $ do
+        Entity project_id project <- getBy404 (UniqueProjectHandle project_handle)
+        tagged_tickets <- fetchProjectOpenTicketsDB project_id muser_id
+        return (project, tagged_tickets)
+
+    ((result, formWidget), encType) <- runFormGet viewForm
+    let (filter_expression, order_expression) = case result of
+            FormSuccess x -> x
+            _ -> (defaultFilter, defaultOrder)
+
+    github_issues <- getGithubIssues project
+
+    let issues = sortBy (flip compare `on` order_expression . issueOrderable) $
+                   filter (filter_expression . issueFilterable) $
+                      map mkSomeIssue tagged_tickets ++ map mkSomeIssue github_issues
+
+    defaultLayout $ do
+        setTitle . toHtml $ projectName project <> " Tickets | Snowdrift.coop"
+        $(widgetFile "tickets")
+
+
+--------------------------------------------------------------------------------
+-- /transactions
+
 getProjectTransactionsR :: Text -> Handler Html
 getProjectTransactionsR project_handle = do
-    maybe_viewer_id <- maybeAuthId
-
-    (project, account, account_map, transaction_groups) <- runDB $ do
+    (project, account, account_map, transaction_groups) <- runYDB $ do
         Entity _ project :: Entity Project <- getBy404 $ UniqueProjectHandle project_handle
 
         account <- get404 $ projectAccount project
@@ -320,106 +1310,46 @@ getProjectTransactionsR project_handle = do
                 = (fmap (payday_map M.!) $ transactionPayday $ entityVal t', reverse (t':ts')) : process' [t] ts
          in process' []
 
+--------------------------------------------------------------------------------
+-- /w
 
-getProjectBlogR :: Text -> Handler Html
-getProjectBlogR project_handle = do
-    maybe_from <- fmap (Key . PersistInt64 . read . T.unpack) <$> lookupGetParam "from"
-    post_count <- fromMaybe 10 <$> fmap (read . T.unpack) <$> lookupGetParam "from"
-    Entity project_id project <- runDB $ getBy404 $ UniqueProjectHandle project_handle
+getWikiPagesR :: Text -> Handler Html
+getWikiPagesR project_handle = do
+    muser_id <- maybeAuthId
+    languages <- getLanguages
 
-    let apply_offset blog = maybe id (\ from_blog rest -> blog ^. ProjectBlogId >=. val from_blog &&. rest) maybe_from
+    -- TODO: should be be using unviewed_comments and unviewed_edits?
+    (project, wiki_targets, _, _) <- runYDB $ do
+        Entity project_id project <- getBy404 $ UniqueProjectHandle project_handle
+        wiki_targets <- getProjectWikiPages languages project_id
 
-    (posts, next) <- fmap (splitAt post_count) $ runDB $ select $ from $ \blog -> do
-        where_ $ apply_offset blog $ blog ^. ProjectBlogProject ==. val project_id
-        orderBy [ desc $ blog ^. ProjectBlogTime, desc $ blog ^. ProjectBlogId ]
-        limit (fromIntegral post_count + 1)
-        return blog
-
-    renderRouteParams <- getUrlRenderParams
-
-    let nextRoute next_id = renderRouteParams (ProjectBlogR project_handle) [("from", toPathPiece next_id)]
-
+        -- If the user is not logged in or not watching the project, these maps are empty.
+        (unviewed_comments, unviewed_edits) <- case muser_id of
+            Nothing -> return (mempty, mempty)
+            Just user_id -> do
+                is_watching <- userIsWatchingProjectDB user_id project_id
+                if is_watching
+                    then (,)
+                        <$> fetchNumUnviewedCommentsOnProjectWikiPagesDB user_id project_id
+                        <*> fetchNumUnviewedWikiEditsOnProjectDB         user_id project_id
+                    else return (mempty, mempty)
+        return (project, wiki_targets, unviewed_comments, unviewed_edits)
     defaultLayout $ do
-        setTitle . toHtml $ projectName project <> " Blog | Snowdrift.coop"
-        $(widgetFile "project_blog")
+        setTitle . toHtml $ projectName project <> " Wiki | Snowdrift.coop"
+        $(widgetFile "wiki_pages")
 
-projectBlogForm :: UTCTime -> UserId -> ProjectId -> Form ProjectBlog
-projectBlogForm now user_id project_id =
-    renderBootstrap3 $ mkBlog
-        <$> areq' textField "Post Title" Nothing
-        <*> areq' snowdriftMarkdownField "Post" Nothing
-  where
-    mkBlog :: Text -> Markdown -> ProjectBlog
-    mkBlog title (Markdown content) =
-        let (top_content, bottom_content) = break (== "---") $ T.lines content
-         in ProjectBlog now title user_id project_id undefined (Markdown $ T.unlines top_content) (if null bottom_content then Nothing else Just $ Markdown $ T.unlines bottom_content)
+--------------------------------------------------------------------------------
+-- /watch, /unwatch
 
+postWatchProjectR, postUnwatchProjectR :: ProjectId -> Handler ()
+postWatchProjectR   = watchOrUnwatchProject userWatchProjectDB   "watching "
+postUnwatchProjectR = watchOrUnwatchProject userUnwatchProjectDB "no longer watching "
 
-postProjectBlogR :: Text -> Handler Html
-postProjectBlogR project_handle = do
-    viewer_id <- requireAuthId
-
-    Entity project_id _ <- runDB $ do
-        can_edit <- or <$> sequence
-            [ isProjectAdmin project_handle viewer_id
-            , isProjectTeamMember project_handle viewer_id
-            , isProjectAdmin "snowdrift" viewer_id
-            ]
-
-        if can_edit
-         then getBy404 $ UniqueProjectHandle project_handle
-         else permissionDenied "You do not have permission to edit this project."
-
-    now <- liftIO getCurrentTime
-
-    ((result, _), _) <- runFormPost $ projectBlogForm now viewer_id project_id
-
-    case result of
-        FormSuccess blog_post' -> do
-            let blog_post :: ProjectBlog
-                blog_post = blog_post' { projectBlogTime = now, projectBlogUser = viewer_id }
-            mode <- lookupPostParam "mode"
-            let action :: Text = "post"
-            case mode of
-                Just "preview" -> do
-
-                    (form, _) <- generateFormPost $ projectBlogForm now viewer_id project_id
-
-                    defaultLayout $ renderPreview form action $ renderBlogPost project_handle blog_post
-
-                Just x | x == action -> do
-                    void $ runDB $ insert blog_post
-                    addAlert "success" "posted"
-                    redirect $ ProjectR project_handle
-
-                _ -> do
-                    addAlertEm "danger" "unrecognized mode" "Error: "
-                    redirect $ ProjectR project_handle
-
-        x -> do
-            addAlert "danger" $ T.pack $ show x
-            redirect $ ProjectR project_handle
-
-
-getProjectBlogPostR :: Text -> ProjectBlogId -> Handler Html
-getProjectBlogPostR project_handle blog_post_id = do
-    Entity _ project <- runDB $ getBy404 $ UniqueProjectHandle project_handle
-    blog_post <- runDB $ get404 blog_post_id
-
-    defaultLayout $ do
-        setTitle . toHtml $ projectName project <> " Blog - " <> projectBlogTitle blog_post <> " | Snowdrift.coop"
-        renderBlogPost project_handle blog_post
-
-
-renderBlogPost :: Text -> ProjectBlog -> WidgetT App IO ()
-renderBlogPost project_handle blog_post = do
-    now <- liftIO getCurrentTime
-
-    let (Markdown top_content) = projectBlogTopContent blog_post
-        (Markdown bottom_content) = fromMaybe (Markdown "") $ projectBlogBottomContent blog_post
-        title = projectBlogTitle blog_post
-        content = markdownWidget project_handle $ Markdown $ T.snoc top_content '\n' <> bottom_content
-
-    $(widgetFile "blog_post")
-
-
+watchOrUnwatchProject :: (UserId -> ProjectId -> DB ()) -> Text -> ProjectId -> Handler ()
+watchOrUnwatchProject action msg project_id = do
+    user_id <- requireAuthId
+    project <- runYDB $ do
+        action user_id project_id
+        get404 project_id
+    alertSuccess (msg <> projectName project)
+    redirect HomeR

@@ -11,9 +11,10 @@ import qualified Data.Text as T
 
 getInvitationR :: Text -> Text -> Handler Html
 getInvitationR project_handle code = do
-    Entity _ project <- runDB $ getBy404 $ UniqueProjectHandle project_handle
-    Entity invite_id invite <- runDB $ getBy404 $ UniqueInvite code
-    maybe_user_id <- maybeAuthId
+    (Entity _ project, Entity _ invite) <- runYDB $ (,)
+        <$> getBy404 (UniqueProjectHandle project_handle)
+        <*> getBy404 (UniqueInvite code)
+    maybe_user_id    <- maybeAuthId
 
     unless (isJust maybe_user_id) setUltDestCurrent
 
@@ -24,13 +25,13 @@ getInvitationR project_handle code = do
     defaultLayout $ do
         setTitle . toHtml $ projectName project <> " Invitation - " <> (T.pack . show $ inviteRole invite) <> " | Snowdrift.coop"
         $(widgetFile "invitation")
-    
+
 
 postInvitationR :: Text -> Text -> Handler Html
 postInvitationR _ code = do
     viewer_id :: UserId <- requireAuthId
     now <- liftIO getCurrentTime
-    _ <- runDB $ do
+    _ <- runYDB $ do
         Entity invite_id invite <- getBy404 $ UniqueInvite code
 
         if inviteRedeemed invite
@@ -50,5 +51,5 @@ postInvitationR _ code = do
             return $ Just $ inviteRole invite
 
     redirectUltDest HomeR
-    
-    
+
+

@@ -1,21 +1,168 @@
-module Model.Project where
+module Model.Project
+    ( ProjectSummary(..)
+    , UpdateProject(..)
+    , fetchPublicProjectsDB
+    , fetchProjectCommentRethreadsBeforeDB
+    , fetchProjectCommentsIncludingRethreadedBeforeDB
+    , fetchProjectCommentClosingsBeforeDB
+    , fetchProjectDeletedPledgesBeforeDB
+    , fetchProjectDiscussionsDB
+    , fetchProjectNewPledgesBeforeDB
+    , fetchProjectModeratorsDB
+    , fetchProjectTeamMembersDB
+    , fetchProjectOpenTicketsDB
+    , fetchProjectUpdatedPledgesBeforeDB
+    , fetchProjectVolunteerApplicationsDB
+    , fetchProjectWikiEditsWithTargetsBeforeDB
+    , fetchProjectWikiPagesWithTargetsBeforeDB
+    , fetchProjectBlogPostsBeforeDB
+    , fetchProjectTicketClaimingsBeforeDB
+    , fetchProjectTicketUnclaimingsBeforeDB
+    , fetchProjectWikiPageByNameDB
+    , insertProjectPledgeDB
+    -- TODO(mitchell): rename all these... prefix fetch, suffix DB
+    , getGithubIssues
+    , getProjectPages
+    , getProjectShares
+    , getProjectTagList
+    , getProjectWikiPages
+    , projectComputeShareValue
+    , projectNameWidget
+    , summarizeProject
+    , updateShareValue
+    ) where
 
 import Import
 
+import Data.Filter
+import Data.Order
+import Model.Comment
+import Model.Comment.Sql
 import Model.Currency
-import Model.ViewType
-import Model.User
+import Model.Issue
+import Model.Tag
+import Model.Wiki.Sql
+import Widgets.Tag
 
-import Control.Monad.Trans.Resource
+import           Control.Monad.Trans.Maybe    (MaybeT(..), runMaybeT)
+import           Control.Monad.Trans.Resource (MonadThrow)
+import           Control.Monad.Writer.Strict  (tell)
+import           Control.Concurrent.Async     (Async, async, wait)
+import qualified Github.Data                  as GH
+import qualified Github.Issues                as GH
+import qualified Data.Map                     as M
+import qualified Data.Set                     as S
+import qualified Data.Text                    as T
 
-data ProjectSummary =
-    ProjectSummary
-        { summaryName :: Text
-        , summaryProjectHandle :: Text
-        , summaryUsers :: UserCount
-        , summaryShares :: ShareCount
-        , summaryShareCost :: Milray
-        }
+import           Data.List                    (sortBy)
+
+--------------------------------------------------------------------------------
+-- Types
+
+data ProjectSummary = ProjectSummary
+    { summaryName          :: Text
+    , summaryProjectHandle :: Text
+    , summaryUsers         :: UserCount
+    , summaryShares        :: ShareCount
+    , summaryShareCost     :: Milray
+    }
+
+data UpdateProject = UpdateProject
+    { updateProjectName        :: Text
+    , updateProjectDescription :: Markdown
+    , updateProjectTags        :: [Text]
+    , updateProjectGithubRepo  :: Maybe Text
+    } deriving Show
+
+newtype TaggedTicket = TaggedTicket ((Entity Ticket), [AnnotatedTag])
+
+instance Issue TaggedTicket where
+    issueWidget (TaggedTicket ((Entity ticket_id ticket),tags)) =
+        [whamlet|
+          <tr>
+            <td>
+              <a href="@{CommentDirectLinkR (ticketComment ticket)}">
+                SD-#{toPathPiece ticket_id}
+            <td>
+              #{ticketName ticket}
+            <td>
+              $forall tag <- tags
+                ^{tagWidget tag}
+        |]
+    issueFilterable = ticketToFilterable
+    issueOrderable = ticketToOrderable
+
+ticketToFilterable :: TaggedTicket -> Filterable
+ticketToFilterable (TaggedTicket (Entity _ ticket, tags)) = Filterable has_tag get_named_ts search_literal
+  where
+    has_tag t = any (\tag -> annotTagName tag == t && annotTagScore tag > 0) tags
+
+    get_named_ts "CREATED" = S.singleton $ ticketCreatedTs ticket
+    get_named_ts "LAST UPDATED" = S.singleton $ ticketUpdatedTs ticket
+    get_named_ts name = error $ "Unrecognized time name " ++ T.unpack name
+
+    search_literal str = (not . null . T.breakOnAll str) (ticketName ticket)
+
+ticketToOrderable :: TaggedTicket -> Orderable
+ticketToOrderable (TaggedTicket ((Entity _ ticket),tags)) = Orderable has_tag get_named_ts search_literal
+  where
+    has_tag t = elem t $ map annotTagName tags
+    get_named_ts "CREATED" = S.singleton $ ticketCreatedTs ticket
+    get_named_ts "LAST UPDATED" = S.singleton $ ticketUpdatedTs ticket
+    get_named_ts name = error $ "Unrecognized time name " ++ T.unpack name
+    search_literal str = (not . null . T.breakOnAll str) (ticketName ticket)
+
+--------------------------------------------------------------------------------
+-- Database actions
+
+fetchPublicProjectsDB :: DB [Entity Project]
+fetchPublicProjectsDB = select $ from $ \ p -> do
+    where_ $ p ^. ProjectPublic
+    return p
+
+insertProjectPledgeDB :: UserId
+                      -> ProjectId
+                      -> Int64
+                      -> PledgeFormRenderedId
+                      -> SDB ()
+insertProjectPledgeDB user_id project_id shares pledge_render_id = do
+    now <- liftIO getCurrentTime
+    let shares_pledged = SharesPledged now user_id project_id shares pledge_render_id
+    shares_pledged_id <- lift (insert shares_pledged)
+    getBy (UniquePledge user_id project_id) >>= \case
+        Nothing -> do
+            lift $ insert_ (Pledge now user_id project_id shares shares)
+            tell [ENewPledge shares_pledged_id shares_pledged]
+        Just (Entity pledge_id old_pledge) -> do
+            if shares == 0
+                then do
+                    lift (deleteKey pledge_id)
+                    tell [EDeletedPledge now user_id project_id (pledgeShares old_pledge)]
+                else do
+                    lift $
+                        update $ \p -> do
+                        set p [ PledgeShares       =. val shares
+                              , PledgeFundedShares =. val shares
+                              ]
+                        where_ (p ^. PledgeId ==. val pledge_id)
+                    tell [EUpdatedPledge (pledgeShares old_pledge) shares_pledged_id shares_pledged]
+
+getGithubIssues :: Project -> Handler [GH.Issue]
+getGithubIssues project =
+    getGithubIssues'
+    >>= liftIO . wait
+    >>= either (\_ -> addAlert "danger" "failed to fetch GitHub tickets\n" >> return [])
+               return
+  where
+    getGithubIssues' :: Handler (Async (Either GH.Error [GH.Issue]))
+    getGithubIssues' = liftIO . async $
+        maybe
+            (return $ Right [])
+            (\(account, repo) -> GH.issuesForRepo account repo [])
+            parsedProjectGithubRepo
+
+    parsedProjectGithubRepo :: Maybe (String, String)
+    parsedProjectGithubRepo = second (drop 1) . break (== '/') . T.unpack <$> projectGithubRepo project
 
 summarizeProject :: Monad m => Entity Project -> [Entity Pledge] -> m ProjectSummary
 summarizeProject project pledges = do
@@ -34,6 +181,13 @@ getProjectShares project_id = do
 
     return $ map (pledgeFundedShares . entityVal) pledges
 
+-- | Get all WikiPages for a Project.
+getProjectPages :: ProjectId -> DB [Entity WikiPage]
+getProjectPages project_id =
+    select $
+    from $ \page -> do
+    where_ $ page ^. WikiPageProject ==. val project_id
+    return page
 
 projectComputeShareValue :: [Int64] -> Milray
 projectComputeShareValue pledges =
@@ -42,70 +196,23 @@ projectComputeShareValue pledges =
         geomean :: [Double] -> Double
         geomean xs = exp $ sum (map log xs) / fromIntegral (length xs)
         multiplier = lg (geomean (map fromIntegral pledges) * 2)
-     in Milray 1 $* (multiplier * (num_users - 1))
+     in Milray 10 $* (multiplier * (num_users - 1))
 
 
+-- signature needs to remain generic, for SnowdriftProcessPayments
 updateShareValue :: (MonadThrow m, MonadIO m, MonadBaseControl IO m, MonadLogger m, MonadResource m) => ProjectId -> SqlPersistT m ()
 updateShareValue project_id = do
     pledges <- getProjectShares project_id
-    
+
     update $ \ project -> do
         set project  [ ProjectShareValue =. val (projectComputeShareValue pledges) ]
         where_ (project ^. ProjectId ==. val project_id)
-
-getCounts :: (MonadLogger m, MonadResource m, MonadIO m, MonadBaseControl IO m, MonadThrow m)
-    => Entity User -> [Entity Project] -> SqlPersistT m [([Value Int], [Value Int])]
-
-getCounts (Entity user_id user) = mapM $ \(Entity project_id project) -> do
-    moderator <- isProjectModerator (projectHandle project) user_id
-
-    comment_viewtimes :: [Entity ViewTime] <- select $ from $ \ viewtime -> do
-        where_ $ 
-            ( viewtime ^. ViewTimeUser ==. val user_id ) &&.
-            ( viewtime ^. ViewTimeProject ==. val project_id ) &&.
-            ( viewtime ^. ViewTimeType ==. val ViewComments )
-        return viewtime
-
-    edit_viewtimes :: [Entity ViewTime] <- select $ from $ \ viewtime -> do
-        where_ $
-            ( viewtime ^. ViewTimeUser ==. val user_id ) &&.
-            ( viewtime ^. ViewTimeProject ==. val project_id ) &&.
-            ( viewtime ^. ViewTimeType ==. val ViewEdits )
-        return viewtime
-
-    let comments_ts = case comment_viewtimes of
-            [] -> userReadComments user
-            Entity _ viewtime : _ -> viewTimeTime viewtime
-        edits_ts = case edit_viewtimes of
-            [] -> userReadEdits user
-            Entity _ viewtime : _ -> viewTimeTime viewtime
-
-    comments <- select $ from $ \(comment `LeftOuterJoin` wp) -> do
-        on_ $ wp ^. WikiPageDiscussion ==. comment ^. CommentDiscussion
-        where_ $ foldl1 (&&.) $ catMaybes
-            [ Just $ comment ^. CommentCreatedTs >=. val comments_ts
-            , Just $ wp ^. WikiPageProject ==. val project_id
-            , Just $ comment ^. CommentUser !=. val user_id
-            , if moderator then Nothing else Just $ not_ $ isNothing $ comment ^. CommentModeratedTs
-            ]
-        return (countRows :: SqlExpr (Value Int))
-
-    edits <- select $ from $ \(edit `LeftOuterJoin` wp) -> do
-        on_ (wp ^. WikiPageId ==. edit ^. WikiEditPage)
-        where_ $
-            ( edit ^. WikiEditTs >=. val edits_ts ) &&.
-            ( wp ^. WikiPageProject ==. val project_id ) &&.
-            ( edit ^. WikiEditUser !=. val user_id )
-        return (countRows :: SqlExpr (Value Int))
-
-    return (comments, edits)
 
 {-
  - TODO
  -  Unfund shares
  -  Fix algorithm
  -}
-
 
 projectNameWidget :: ProjectId -> Widget
 projectNameWidget project_id = do
@@ -114,3 +221,268 @@ projectNameWidget project_id = do
         Nothing -> [whamlet| (unknown project) |]
         Just project -> [whamlet| #{projectName project} |]
 
+getProjectTagList :: ProjectId -> DB ([Entity Tag], [Entity Tag])
+getProjectTagList project_id = (,) <$> getProjectTags <*> getOtherTags
+  where
+    getProjectTags :: DB [Entity Tag]
+    getProjectTags =
+        selectDistinct $
+        from $ \(tag `InnerJoin` rel `InnerJoin` comment `InnerJoin` page) -> do
+        on_ ( page ^. WikiPageDiscussion ==. comment ^. CommentDiscussion )
+        on_ ( comment ^. CommentId ==. rel ^. CommentTagComment )
+        on_ ( rel ^. CommentTagTag ==. tag ^. TagId )
+        where_ ( page ^. WikiPageProject ==. val project_id )
+        orderBy [ desc (tag ^. TagName) ]
+        return tag
+
+    getOtherTags :: DB [Entity Tag]
+    getOtherTags =
+        selectDistinct $
+        from $ \(tag `InnerJoin` rel `InnerJoin` comment `InnerJoin` page) -> do
+        on_ ( page ^. WikiPageDiscussion ==. comment ^. CommentDiscussion )
+        on_ ( comment ^. CommentId ==. rel ^. CommentTagComment )
+        on_ ( rel ^. CommentTagTag ==. tag ^. TagId )
+        where_ ( page ^. WikiPageProject !=. val project_id )
+        orderBy [ desc (tag ^. TagName) ]
+        return tag
+
+-- | Get all of a Project's WikiPages, sorted alphabetically.
+getProjectWikiPages :: [Language] -> ProjectId ->  DB [Entity WikiTarget]
+getProjectWikiPages languages project_id = do
+    targets <- select $ from $ \ wt -> do
+        where_ $ wt ^. WikiTargetProject ==. val project_id
+        return wt
+
+    return $ sortBy (compare `on` (wikiTargetTarget . entityVal)) $ pickTargetsByLanguage languages targets
+
+-- | Fetch all Discussions that are somewhere on the given Project.
+fetchProjectDiscussionsDB :: ProjectId -> DB [DiscussionId]
+fetchProjectDiscussionsDB project_id = do
+    pd <- projectDiscussion <$> getJust project_id
+    wpds <- fmap (map unValue) $ select $ from $ \wp -> do
+                where_ (wp ^. WikiPageProject ==. val project_id)
+                return (wp ^. WikiPageDiscussion)
+    return (pd : wpds)
+
+-- | Get all (posted, not pending) Comments made *somewhere* on a Project, before the given time.
+fetchProjectCommentsIncludingRethreadedBeforeDB :: ProjectId -> Maybe UserId -> UTCTime -> Int64 -> DB [Entity Comment]
+fetchProjectCommentsIncludingRethreadedBeforeDB project_id muser_id before lim = fetchProjectDiscussionsDB project_id >>= \project_discussions ->
+    select $ from $ \(ecp `InnerJoin` c) -> do
+    on_ (ecp ^. EventCommentPostedComment ==. c ^. CommentId)
+    where_ $ ecp ^. EventCommentPostedTs <=. val before
+        &&. exprCommentProjectPermissionFilterIncludingRethreaded muser_id (val project_id) c
+        &&. c ^. CommentDiscussion `in_` valList project_discussions
+    orderBy [ desc $ ecp ^. EventCommentPostedTs, desc $ ecp ^. EventCommentPostedId ]
+    limit lim
+    return c
+
+-- | Get all Rethreads whose *destinations* are on the given Project.
+fetchProjectCommentRethreadsBeforeDB :: ProjectId -> Maybe UserId -> UTCTime -> Int64 -> DB [Entity Rethread]
+fetchProjectCommentRethreadsBeforeDB project_id muser_id before lim = fetchProjectDiscussionsDB project_id >>= \project_discussions ->
+    select $ from $ \(ecr `InnerJoin` r `InnerJoin` c) -> do
+        on_ (r ^. RethreadNewComment ==. c ^. CommentId)
+        on_ (ecr ^. EventCommentRethreadedRethread ==. r ^. RethreadId)
+        where_ $ ecr ^. EventCommentRethreadedTs <=. val before
+            &&. exprCommentProjectPermissionFilter muser_id (val project_id) c
+            &&.  c ^. CommentDiscussion `in_` valList project_discussions
+        orderBy [ desc $ ecr ^. EventCommentRethreadedTs, desc $ ecr ^. EventCommentRethreadedId ]
+        limit lim
+        return r
+
+-- | Get all Closings for comments on the current project
+fetchProjectCommentClosingsBeforeDB :: ProjectId -> Maybe UserId -> UTCTime -> Int64 -> DB [Entity CommentClosing]
+fetchProjectCommentClosingsBeforeDB project_id muser_id before lim = fetchProjectDiscussionsDB project_id >>= \project_discussions ->
+    select $ from $ \(closing `InnerJoin` comment) -> do
+        on_ (closing ^. CommentClosingComment ==. comment ^. CommentId)
+        where_ $ closing ^. CommentClosingTs <=. val before
+            &&. exprCommentProjectPermissionFilter muser_id (val project_id) comment
+            &&.  comment ^. CommentDiscussion `in_` valList project_discussions
+
+        orderBy [ desc $ closing ^. CommentClosingTs, desc $ closing ^. CommentClosingId ]
+        limit lim
+        return closing
+
+fetchProjectTicketClaimingsBeforeDB :: ProjectId -> UTCTime -> Int64 -> DB [Either (Entity TicketClaiming) (Entity TicketOldClaiming)]
+fetchProjectTicketClaimingsBeforeDB project_id before lim = do
+    project_discussions <- fetchProjectDiscussionsDB project_id
+    tuples <- select $ from $ \ (t `InnerJoin` c `LeftOuterJoin` toc `LeftOuterJoin` tc) -> do
+        on_ (tc ?. TicketClaimingTicket ==. just (c ^. CommentId))
+        on_ (toc ?. TicketOldClaimingTicket ==. just (c ^. CommentId))
+        on_ (t ^. TicketComment ==. c ^. CommentId)
+
+        where_ $ coalesce [tc ?. TicketClaimingTs, toc ?. TicketOldClaimingClaimTs] <=. just (val before)
+            &&. c ^. CommentDiscussion `in_` valList project_discussions
+            &&. not_ (isNothing $ coalesce [ tc ?. TicketClaimingTs, toc ?. TicketOldClaimingClaimTs ])
+
+        orderBy [ desc $ coalesce [ tc ?. TicketClaimingTs, toc ?. TicketOldClaimingClaimTs ], desc $ tc ?. TicketClaimingId, desc $ toc ?. TicketOldClaimingId ]
+        limit lim
+        return (tc, toc)
+
+    let tupleToMaybeEither (Just x, Nothing) = Just $ Left x
+        tupleToMaybeEither (Nothing, Just y) = Just $ Right y
+        tupleToMaybeEither _ = Nothing
+
+    return $ mapMaybe tupleToMaybeEither tuples
+
+fetchProjectTicketUnclaimingsBeforeDB :: ProjectId -> UTCTime -> Int64 -> DB [Entity TicketOldClaiming]
+fetchProjectTicketUnclaimingsBeforeDB project_id before lim = fetchProjectDiscussionsDB project_id >>= \project_discussions ->
+    select $ from $ \ (tc `InnerJoin` c `InnerJoin` t) -> do
+        on_ (t ^. TicketComment ==. c ^. CommentId)
+        on_ (tc ^. TicketOldClaimingTicket ==. c ^. CommentId)
+
+        where_ $ tc ^. TicketOldClaimingReleasedTs <=. val before
+            &&.  c ^. CommentDiscussion `in_` valList project_discussions
+
+        orderBy [ desc $ tc ^. TicketOldClaimingReleasedTs, desc $ tc ^. TicketOldClaimingId ]
+        limit lim
+        return tc
+
+-- | Fetch all WikiPages made on this Project before this time.
+fetchProjectWikiPagesWithTargetsBeforeDB :: [Language] -> ProjectId -> UTCTime -> Int64 -> DB [(Entity WikiPage, WikiTarget)]
+fetchProjectWikiPagesWithTargetsBeforeDB languages project_id before lim = do
+    pages <- select $ from $ \(ewp `InnerJoin` wp) -> do
+        on_ (ewp ^. EventWikiPageWikiPage ==. wp ^. WikiPageId)
+        where_ $ ewp ^. EventWikiPageTs <=. val before
+            &&. exprWikiPageOnProject wp project_id
+        orderBy [ desc $ ewp ^. EventWikiPageTs, desc $ ewp ^. EventWikiPageId ]
+        limit lim
+        return wp
+
+    targets <- select $ from $ \ wt -> do
+        where_ $ wt ^. WikiTargetPage `in_` valList (map entityKey pages)
+        return wt
+
+
+    let pages_map = M.fromList $ map (onEntity (,)) pages
+        targets_map = M.fromList $ map (\ (Entity _ wiki_target) -> (wikiTargetPage wiki_target, wiki_target)) $ pickTargetsByLanguage languages targets
+
+    return $ M.elems $ M.intersectionWithKey ( \ wiki_page_id wiki_page wiki_target -> (Entity wiki_page_id wiki_page, wiki_target) ) pages_map targets_map
+
+-- | Fetch all BlogPosts made on this Project before this time.
+fetchProjectBlogPostsBeforeDB :: ProjectId -> UTCTime -> Int64 -> DB [Entity BlogPost]
+fetchProjectBlogPostsBeforeDB project_id before lim =
+    select $
+    from $ \(ebp `InnerJoin` bp) -> do
+    on_ (ebp ^. EventBlogPostPost ==. bp ^. BlogPostId)
+    where_ $
+        ebp ^. EventBlogPostTs <=. val before &&.
+        bp ^. BlogPostProject ==. val project_id
+    orderBy [ desc $ ebp ^. EventBlogPostTs, desc $ ebp ^. EventBlogPostId ]
+    limit lim
+    return bp
+
+-- | Fetch all WikiEdits made on this Project before this time.
+fetchProjectWikiEditsWithTargetsBeforeDB :: [Language] -> ProjectId -> UTCTime -> Int64 -> DB [(Entity WikiEdit, WikiTarget)]
+fetchProjectWikiEditsWithTargetsBeforeDB languages project_id before lim = do
+-- | Fetch all WikiPages made on this Project before this time.
+
+    edits <- select $ from $ \(ewe `InnerJoin` we `InnerJoin` wp) -> do
+        on_ (wp ^. WikiPageId ==. we ^. WikiEditPage)
+        on_ (ewe ^. EventWikiEditWikiEdit ==. we ^. WikiEditId)
+
+        where_ $ ewe ^. EventWikiEditTs <=. val before
+            &&.  exprWikiPageOnProject wp project_id
+
+        orderBy [ desc $ ewe ^. EventWikiEditTs, desc $ ewe ^. EventWikiEditId ]
+        limit lim
+        return we
+
+    targets <- select $ from $ \ wt -> do
+        where_ $ wt ^. WikiTargetPage `in_` valList (map (wikiEditPage . entityVal) edits)
+        return wt
+
+    let edits_map = M.fromListWith (++) $ map (\ edit -> (wikiEditPage $ entityVal edit, [edit])) edits
+        targets_map = M.fromList $ map (\ (Entity _ wiki_target) -> (wikiTargetPage wiki_target, wiki_target)) $ pickTargetsByLanguage languages targets
+
+    return $ concat $ M.elems $ M.intersectionWith (\ xs y -> (,) <$> xs <*> pure y)  edits_map targets_map
+
+-- | Fetch all new SharesPledged made on this Project before this time.
+fetchProjectNewPledgesBeforeDB :: ProjectId -> UTCTime -> Int64 -> DB [Entity SharesPledged]
+fetchProjectNewPledgesBeforeDB project_id before lim =
+    select $
+    from $ \(enp `InnerJoin` sp) -> do
+    on_ (enp ^. EventNewPledgeSharesPledged ==. sp ^. SharesPledgedId)
+    where_ $
+        enp ^. EventNewPledgeTs <=. val before &&.
+        sp ^. SharesPledgedProject ==. val project_id
+    orderBy [ desc $ enp ^. EventNewPledgeTs, desc $ enp ^. EventNewPledgeId ]
+    limit lim
+    return sp
+
+-- | Fetch all updated Pledges made on this Project before this time, along with the old number of shares.
+fetchProjectUpdatedPledgesBeforeDB :: ProjectId -> UTCTime -> Int64 -> DB [(Int64, Entity SharesPledged)]
+fetchProjectUpdatedPledgesBeforeDB project_id before lim = fmap (map (\(Value n, p) -> (n, p))) $
+    select $
+    from $ \(eup `InnerJoin` sp) -> do
+    on_ (eup ^. EventUpdatedPledgeSharesPledged ==. sp ^. SharesPledgedId)
+    where_ $
+        eup ^. EventUpdatedPledgeTs <=. val before &&.
+        sp ^. SharesPledgedProject ==. val project_id
+    orderBy [ desc $ eup ^. EventUpdatedPledgeTs, desc $ eup ^. EventUpdatedPledgeId ]
+    limit lim
+    return (eup ^. EventUpdatedPledgeOldShares, sp)
+
+-- | Fetch all deleted pledge events made on this Project before this time.
+fetchProjectDeletedPledgesBeforeDB :: ProjectId -> UTCTime -> Int64 -> DB [EventDeletedPledge]
+fetchProjectDeletedPledgesBeforeDB project_id before lim = fmap (map entityVal) $
+    select $
+    from $ \edp -> do
+    where_ $
+        edp ^. EventDeletedPledgeTs      <=. val before &&.
+        edp ^. EventDeletedPledgeProject ==. val project_id
+    orderBy [ desc $ edp ^. EventDeletedPledgeTs, desc $ edp ^. EventDeletedPledgeId ]
+    limit lim
+    return edp
+
+-- | Fetch this Project's team members.
+fetchProjectTeamMembersDB :: ProjectId -> DB [UserId]
+fetchProjectTeamMembersDB = fetchProjectRoleDB TeamMember
+
+fetchProjectModeratorsDB :: ProjectId -> DB [UserId]
+fetchProjectModeratorsDB = fetchProjectRoleDB Moderator
+
+-- | Abstract fetching Project Admins, TeamMembers, etc. Not exported.
+fetchProjectRoleDB :: Role -> ProjectId -> DB [UserId]
+fetchProjectRoleDB role project_id = fmap (map unValue) $
+    select $
+    from $ \pur -> do
+    where_ $
+        pur ^. ProjectUserRoleProject ==. val project_id &&.
+        pur ^. ProjectUserRoleRole    ==. val role
+    return (pur ^. ProjectUserRoleUser)
+  --
+-- | Fetch all Project VolunteerApplications.
+fetchProjectVolunteerApplicationsDB :: ProjectId -> DB [Entity VolunteerApplication]
+fetchProjectVolunteerApplicationsDB project_id =
+    select $
+    from $ \va -> do
+    where_ (va ^. VolunteerApplicationProject ==. val project_id)
+    orderBy [desc (va ^. VolunteerApplicationCreatedTs)]
+    return va
+
+-- | Fetch a WikiPage (maybe), given the Project handle and WikiPage target.
+-- (Presumably, these Texts come from something like a rethread form,
+-- where the user types in URLs manually).
+fetchProjectWikiPageByNameDB :: Text -> Language -> Text -> DB (Maybe (Entity WikiPage))
+fetchProjectWikiPageByNameDB project_handle language target = runMaybeT $ do
+    Entity project_id _ <- MaybeT $ getBy $ UniqueProjectHandle project_handle
+    Entity _ wiki_target <- MaybeT $ getBy $ UniqueWikiTarget project_id language target
+    wiki_page <- MaybeT $ get $ wikiTargetPage wiki_target
+    return $ Entity (wikiTargetPage wiki_target) wiki_page
+
+fetchProjectOpenTicketsDB :: ProjectId -> Maybe UserId -> DB [TaggedTicket]
+fetchProjectOpenTicketsDB project_id muser_id = do
+    tickets <- fetchProjectDiscussionsDB project_id >>= fetch_tickets
+    annot_tags_map <- fetchCommentCommentTagsInDB (map (ticketComment . entityVal) tickets) >>= buildAnnotatedCommentTagsDB muser_id
+    let tagTicket :: Entity Ticket -> TaggedTicket
+        tagTicket t@(Entity _ ticket) = TaggedTicket (t, M.findWithDefault [] (ticketComment ticket) annot_tags_map)
+    return (map tagTicket tickets)
+  where
+    fetch_tickets discussion_ids =
+        select $
+        from $ \(t `InnerJoin` c) -> do
+        on_ (t ^. TicketComment ==. c ^. CommentId)
+        where_ $
+            c ^. CommentDiscussion `in_` valList discussion_ids &&.
+            exprCommentOpen c
+        return t

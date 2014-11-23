@@ -1,8 +1,15 @@
-<form>
+<h1>
+    <div .text-center> Tickets
+
+<form enctype=#{encType}>
     ^{formWidget}
     <input type=submit value="update view">
 
-$if null tickets
+$with num_tickets <- length tagged_tickets
+    #{num_tickets} open #{plural num_tickets "ticket" "tickets"} on this project
+<hr>
+
+$if null issues
     <p> no tickets to display
 $else
     <table>

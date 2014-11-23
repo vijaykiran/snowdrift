@@ -1,8 +1,6 @@
-<div .row>
-    <div .col-xs-6>
-        <a href="@{WikiR project_handle target}"> back to current page
-<hr .wikitop>
-<form action="@{WikiDiffProxyR project_handle target}" method="GET">
+<a href="@{WikiR project_handle language target}"> back to current page
+
+<form action="@{WikiDiffProxyR project_handle language target}" method="GET">
     <table>
         <tr>
             <td colspan="3">
@@ -11,13 +9,13 @@
         $forall (index, Entity edit_id edit) <- editsIndexed
             <tr>
                 <td>
-                    <a href="@{WikiEditR project_handle target edit_id}">
+                    <a href="@{WikiEditR project_handle language target edit_id}">
                         ^{renderTime (wikiEditTs edit)}
                 <td>
                     $with user_id <- wikiEditUser edit
                         $maybe user <- M.lookup user_id users
                             <a href="@{UserR user_id}">
-                                #{userPrintName user}
+                                #{userDisplayName user}
                 <td>
                     $maybe comment <- wikiEditComment edit
                         #{comment}

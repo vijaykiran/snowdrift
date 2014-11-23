@@ -1,10 +1,20 @@
-$forall Entity post_id post <- posts
-    <div>
-        <a href=@{ProjectBlogPostR project_handle post_id}>
-            #{projectBlogTitle post}
+<h1> #{projectName project} Blog 
 
-        <p>
-            ^{markdownWidget project_handle $ projectBlogTopContent post}
+$if null posts
+    No blog posts yet.
+
+$forall Entity _ post <- posts
+    <h2>
+        <a href=@{ProjectBlogPostR project_handle (blogPostHandle post)}>
+            #{blogPostTitle post}
+
+        <small>
+            <span .post-time>^{renderTime $ blogPostTs post}
+
+    <div .blog-post-top>
+        ^{markdownWidgetWith (fixLinks project_handle discussion) $ blogPostTopContent post}
+
+    <hr>
 
 $case next
     $of [Entity next_id _]

@@ -12,12 +12,12 @@ import Data.Conduit.Binary
 
 licenseEntryForm :: Html -> MForm Handler (FormResult LicenseFormData, Widget)
 licenseEntryForm lefHtml = do
-    (licenseNameRes, licenseNameView) <- mreq textField (generateFieldSettings "LicenseName" [("class", "form-control"), ("placeholder", "License Name")]) Nothing
-    (licenseClassificationRes, licenseClassificationView) <- mreq (selectFieldList getLicenseClassificationTypes) (generateFieldSettings "Classification" [("class", "form-control"), ("placeholder", "License Classification")]) Nothing
-    (licenseProjectTypeRes, licenseProjectTypeView) <- mreq (selectFieldList getLicenseProjectTypes) (generateFieldSettings "ProjectType" [("class", "form-control"), ("placeholder", "Project Type")]) Nothing
-    (licenseOptionsRes, licenseOptionsView) <- mopt textareaField (generateFieldSettings "Options" [("class", "form-control"), ("placeholder", "License Options")]) Nothing
-    (licenseWebsiteRes, licenseWebsiteView) <- mreq textField (generateFieldSettings "Website" [("class", "form-control"), ("placeholder", "Web Link to Legal Text")]) Nothing
-    (licenseIconRes, licenseIconView) <- mopt fileField (generateFieldSettings "UploadIcon" [("class", "form-control")]) Nothing
+    (licenseNameRes, licenseNameView)       <- mreq textField (generateFieldSettings "LicenseName" []) Nothing
+    (licenseClassificationRes, licenseClassificationView) <- mreq (selectFieldList getLicenseClassificationTypes) (generateFieldSettings "Classification" []) Nothing
+    (licenseProjectTypeRes, licenseProjectTypeView) <- mreq (selectFieldList getLicenseProjectTypes) (generateFieldSettings "Project Type" []) Nothing
+    (licenseOptionsRes, licenseOptionsView) <- mopt textareaField (generateFieldSettings "License Options" []) Nothing
+    (licenseWebsiteRes, licenseWebsiteView) <- mreq textField (generateFieldSettings "Linkt to legal text" []) Nothing
+    (licenseIconRes, licenseIconView) <- mopt fileField (generateFieldSettings "Upload Icon" []) Nothing
 
     let licenseEntryRes = LicenseFormData
                         <$> licenseNameRes

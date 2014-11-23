@@ -11,15 +11,14 @@ import Model.Currency
 widgetLayout :: WidgetT App IO () -> HandlerT App IO Html
 widgetLayout widget = do
     pc <- widgetToPageContent $ do
-        $(widgetFile "normalize")
-        addStylesheet $ StaticR css_bootstrap_css
+        addStylesheet $ StaticR css_bootstrap_min_css
         widget
     giveUrlRenderer $(hamletFile "templates/widget-wrapper.hamlet")
 
 
 getWidgetR :: Text -> Handler Html
 getWidgetR project_handle = do
-    (project, pledges) <- runDB $ do
+    (project, pledges) <- runYDB $ do
         Entity project_id project <- getBy404 $ UniqueProjectHandle project_handle
         pledges <- getProjectShares project_id
         return (project, pledges)
@@ -28,6 +27,6 @@ getWidgetR project_handle = do
         users = fromIntegral $ length pledges
         shares = fromIntegral $ sum pledges
         project_value = share_value $* shares
-        
+
     widgetLayout $(widgetFile "widget")
-    
+

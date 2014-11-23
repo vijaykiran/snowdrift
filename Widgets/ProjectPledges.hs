@@ -15,7 +15,7 @@ be useful, such as putting the summary number at /u listing perhaps-}
 -- |The summary of pledging to projects shown on user's page
 projectPledgeSummary :: UserId -> Widget
 projectPledgeSummary user_id = do
-    ps <- handlerToWidget $ runDB $ getProjectSummaries user_id
+    ps <- handlerToWidget $ runYDB $ getProjectSummaries user_id
 
     toWidget [hamlet|
         $if null ps
@@ -27,10 +27,11 @@ projectPledgeSummary user_id = do
                 $else
                     <p>Patron to #{length ps} projects
      |]
+
 -- |The listing of all pledges for a given user, shown on u/#/pledges
 projectPledges :: UserId -> Widget
 projectPledges user_id = do
-    ps <- handlerToWidget $ runDB $ getProjectSummaries user_id
+    ps <- handlerToWidget $ runYDB $ getProjectSummaries user_id
 
     let cost = summaryShareCost
         shares = getCount . summaryShares
@@ -43,7 +44,7 @@ projectPledges user_id = do
             <p>
                 Note: For testing purposes only.  No real money is changing hands yet.
             <table .table>
-                $forall summary <- ps 
+                $forall summary <- ps
                     <tr>
                         <td>
                             <a href="@{ProjectR (summaryProjectHandle summary)}">

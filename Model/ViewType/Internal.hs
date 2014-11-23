@@ -1,23 +1,12 @@
-
 module Model.ViewType.Internal where
 
 import Prelude
 
-import Database.Persist.TH
+import Database.Persist.TH (derivePersistField)
 
-import Web.PathPieces
-
-import Data.Text as T
-
-import Debug.Trace
-
-import Data.Universe
-
-data ViewType = ViewComments | ViewEdits | ViewApplications deriving (Bounded, Enum, Eq, Show, Read)
-
-instance Universe ViewType where
-    universe = [ViewComments .. ViewApplications]
-
+data ViewType
+    = ViewApplications
+    deriving (Bounded, Enum, Eq, Show, Read)
 derivePersistField "ViewType"
 
 {- instance PathPiece Role where

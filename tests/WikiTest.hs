@@ -4,28 +4,23 @@ module WikiTest
     ) where
 
 import TestImport
-import qualified Data.Map as M
-import qualified Text.XML as XML
-import qualified Text.HTML.DOM as HTML
 
-import Database.Esqueleto hiding (get)
-
-import Data.Text as T
-
-import Control.Monad
+import Model.Language
 
 wikiSpecs :: Spec
 wikiSpecs =
     ydescribe "wiki" $ do
-        yit "creates a new page" $ do
-            login
 
-            get $ NewWikiR "snowdrift" "testpage"
+        yit "creates a new page" $ [marked|
+
+            loginAs TestUser
+
+            get $ NewWikiR "snowdrift" LangEn "testpage"
             statusIs 200
 
             request $ do
                 addNonce
-                setUrl $ NewWikiR "snowdrift" "testpage"
+                setUrl $ NewWikiR "snowdrift" LangEn "testpage"
                 setMethod "POST"
                 byLabel "Page Content" "test"
                 addPostParam "mode" "preview"
@@ -34,8 +29,42 @@ wikiSpecs =
 
             request $ do
                 addNonce
+                setUrl $ NewWikiR "snowdrift" LangEn "testpage"
                 setMethod "POST"
                 byLabel "Page Content" "test"
                 addPostParam "mode" "post"
 
+            statusIs 302
 
+        |]
+
+        yit "edits a wiki page" $ [marked|
+
+            loginAs TestUser
+
+            get $ EditWikiR "snowdrift" LangEn "testpage"
+            statusIs 200
+
+{- TODO - this needs to get the last_edit_id from the rendered page and pipe it through
+            request $ do
+                addNonce
+                setUrl $ WikiR "snowdrift" LangEn "testpage"
+                setMethod "POST"
+                byLabel "Page Content" "test after edit"
+                byLabel "Comment" "testing"
+                addPostParam "mode" "preview"
+
+            statusIs 200
+
+            request $ do
+                addNonce
+                setUrl $ WikiR "snowdrift" LangEn "testpage"
+                setMethod "POST"
+                byLabel "Page Content" "test after edit"
+                byLabel "Comment" "testing"
+                addPostParam "mode" "post"
+
+            statusIs 302
+-}
+
+        |]

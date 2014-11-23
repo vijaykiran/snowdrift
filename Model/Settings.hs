@@ -6,6 +6,8 @@ import Import
 import Model.Settings.Internal
 import Data.Typeable
 
+import qualified Data.Text as T
+
 data UserSettings = UserSettings { userSettingsShowTagVotes :: Bool }
     deriving (Typeable)
 
@@ -27,5 +29,5 @@ getUserSettings = cached $ do
 
 applyUserSetting :: UserSettings -> UserSetting -> UserSettings
 applyUserSetting user_settings setting@(UserSetting { userSettingSetting = ShowTagVotes }) =
-        user_settings { userSettingsShowTagVotes = read (userSettingValue setting) }
+        user_settings { userSettingsShowTagVotes = read $ T.unpack $ userSettingValue setting }
 

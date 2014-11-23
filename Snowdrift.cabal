@@ -24,59 +24,88 @@ library
                      Data.Filter
                      Data.Order
                      Data.Text.PrettyHtml
+                     Data.Tree.Extra
                      Foundation
                      Import
                      Model
+                     Model.Application
+                     Model.Blog
+                     Model.CollapseState
+                     Model.Comment
+                     Model.Comment.ActionPermissions
+                     Model.Comment.HandlerInfo
+                     Model.Comment.Mods
+                     Model.Comment.Routes
+                     Model.Comment.Sql
                      Model.Currency
-                     Model.ClosureType
-                     Model.Project
-                     Model.ProjectSignup
-                     Model.ProjectSignup.Internal
+                     Model.Discussion
+                     Model.Issue
+                     Model.Language
+                     Model.Language.TH
                      Model.License
                      Model.License.Internal
-                     Model.Role
-                     Model.Permission
-                     Model.Shares
-                     Model.Transaction
-                     Model.AnnotatedTag
                      Model.Markdown
                      Model.Markdown.Diff
-                     Model.User
-                     Model.ViewType
+                     Model.Notification
+                     Model.Notification.Internal
+                     Model.Permission
+                     Model.Permission.Internal
+                     Model.Project
+                     Model.Project.Sql
+                     Model.ProjectSignup
+                     Model.ProjectSignup.Internal
+                     Model.ResetPassword
+                     Model.Role
                      Model.Settings
-                     Model.WikiPage
-                     Model.CollapseState
+                     Model.Shares
+                     Model.SnowdriftEvent
+                     Model.SnowdriftEvent.Internal
+                     Model.Tag
+                     Model.Transaction
+                     Model.User
+                     Model.User.Internal
+                     Model.User.Sql
+                     Model.Utils
+                     Model.ViewType
+                     Model.Wiki
+                     Model.Wiki.Sql
                      Settings
                      Settings.StaticFiles
                      Settings.Development
+                     SnowdriftEventHandler
+                     Handler.BuildFeed
+                     Handler.Comment
+                     Handler.Discussion
                      Handler.Home
-                     Handler.User
-                     Handler.Widget
+                     Handler.HonorPledge
+                     Handler.Image
+                     Handler.Invitation
+                     Handler.JsLicense
+                     Handler.License
+                     Handler.MarkdownTutorial
+                     Handler.Notification
+                     Handler.PostLogin
+                     Handler.Privacy
                      Handler.Project
                      Handler.ProjectSignup
-                     Handler.License
-                     Handler.Invite
-                     Handler.Invitation
-                     Handler.UpdateShares
-                     Handler.Volunteer
-                     Handler.Contact
-                     Handler.Who
-                     Handler.PostLogin
-                     Handler.ToU
-                     Handler.Privacy
-                     Handler.Messages
-                     Handler.Application
-                     Handler.Applications
-                     Handler.JsLicense
-                     Handler.MarkdownTutorial
-                     Handler.UserBalance
-                     Handler.UserPledges
-                     Handler.Wiki
-                     Handler.Discussion
-                     Handler.Tags
-                     Handler.Tickets
                      Handler.RepoFeed
-                     Handler.BuildFeed
+                     Handler.ResetPassword
+                     Handler.ToU
+                     Handler.User
+                     Handler.User.Comment
+                     Handler.Utils
+                     Handler.Volunteer
+                     Handler.Who
+                     Handler.Widget
+                     Handler.Wiki
+                     Handler.Wiki.Comment
+                     View.Comment
+                     View.SnowdriftEvent
+                     View.User
+                     View.Wiki
+                     View.PledgeButton
+                     View.Project
+                     View.ResetPassword
                      Version
                      Widgets.Doc
                      Widgets.Markdown
@@ -85,97 +114,116 @@ library
                      Widgets.Tag
                      Widgets.Preview
                      Widgets.ProjectPledges
+                     TestHandler
 
-    other-modules: Model.Settings.Internal
-                   Model.ClosureType.Internal
-                   Model.CollapseState.Internal
+    other-modules: Model.CollapseState.Internal
+                   Model.Comment.Internal
+                   Model.Established.Internal
                    Model.Role.Internal
+                   Model.Settings.Internal
                    Model.ViewType.Internal
-                   Model.Permission.Internal
 
     if flag(dev) || flag(library-only)
         cpp-options:   -DDEVELOPMENT
-        ghc-options:   -Wall -O0
+        ghc-options:   -Wall -O0 -fhpc
     else
-        ghc-options:   -Wall -O2
+        ghc-options:   -Werror -Wall -O2
 
-    extensions: TemplateHaskell
-                QuasiQuotes
-                OverloadedStrings
-                NoImplicitPrelude
-                MultiParamTypeClasses
-                TypeFamilies
+    extensions: ConstraintKinds
+                DeriveDataTypeable
+                DeriveFunctor
+                EmptyDataDecls
+                ExistentialQuantification
+                FlexibleContexts
+                FlexibleInstances
                 GADTs
                 GeneralizedNewtypeDeriving
-                FlexibleContexts
-                EmptyDataDecls
+                LambdaCase
+                MultiParamTypeClasses
+                MultiWayIf
+                NoImplicitPrelude
                 NoMonomorphismRestriction
-                DeriveDataTypeable
+                QuasiQuotes
+                OverloadedStrings
+                RankNTypes
+                RecordWildCards
                 ScopedTypeVariables
+                TemplateHaskell
+                TupleSections
+                TypeFamilies
+                ViewPatterns
 
     build-depends: base                          >= 4          && < 5
-                 -- , yesod-platform
-                 , yesod
-                 , yesod-core
-                 , yesod-auth
-                 , yesod-auth-hashdb
-                 , yesod-static
-                 , yesod-form
-                 , clientsession
-                 , resourcet
-                 , bytestring
-                 , text
-                 , persistent
-                 , persistent-postgresql
-                 , persistent-template
-                 , template-haskell
-                 , hamlet
-                 , shakespeare
-                 , shakespeare-css
-                 , shakespeare-js
-                 , shakespeare-text
-                 , hjsmin
-                 , monad-control
-                 , wai-extra
-                 , wai-logger
-                 , yaml
-                 , http-conduit
-                 , directory
-                 , warp
-                 , esqueleto
-                 , lifted-base
-                 , vector
-                 , data-default
                  , aeson
-                 , conduit
-                 , conduit-extra
-                 , monad-logger
-                 , fast-logger
-                 , time
-                 , time-units
-                 , transformers
-                 , http-types
-                 , random
-                 , yesod-markdown
-                 , yesod-newsfeed
-                 , Diff
-                 , path-pieces
-                 , containers
+                 , async
+                 , attoparsec
                  , authenticate
                  , blaze-builder
                  , blaze-html
                  , blaze-markup
-                 , attoparsec
-                 , old-locale
-                 , hit < 0.6
-                 , process
-                 , temporary
-                 , regex-tdfa
+                 , bytestring
+                 , clientsession
+                 , conduit
+                 , conduit-extra
+                 , containers
+                 , data-default
+                 , diagrams
+                 , diagrams-lib
+                 , diagrams-rasterific
+                 , Diff
+                 , directory
+                 , esqueleto
+                 , fast-logger
+                 , file-embed
                  , github
-                 , async
+                 , hamlet
+                 , hit < 0.6
+                 , hjsmin
+                 , http-conduit
+                 , http-types
+                 , JuicyPixels
+                 , lifted-base
+                 , mime-mail
+                 , monad-control
+                 , monad-logger
+                 , mtl
+                 , old-locale
+                 , pandoc
+                 , path-pieces
+                 , persistent
+                 , persistent-postgresql
+                 , persistent-template
+                 , process
+                 , random
+                 , regex-tdfa
+                 , resourcet
+                 , semigroups
+                 , shakespeare
+                 , shakespeare-css
+                 , shakespeare-js
+                 , shakespeare-text
+                 , stm
+                 , template-haskell
+                 , temporary
+                 , text
+                 , time
+                 , time-units
+                 , transformers
                  , universe
                  , unix
-                 , mtl
+                 , vector
+                 , wai-extra
+                 , wai-logger
+                 , warp
+                 , yaml
+                 , yesod
+                 , yesod-auth
+                 , yesod-auth-hashdb
+                 , yesod-core
+                 , yesod-form
+                 , yesod-markdown
+                 , yesod-newsfeed
+                 , yesod-static
 
 
 executable         SnowdriftProcessPayments
@@ -225,12 +273,100 @@ executable         Snowdrift
 
     ghc-options:       -threaded -O2
 
+executable         SnowdriftEmailDaemon
+    if flag(dev)
+       ghc-options: -Wall
+    if flag(library-only)
+        Buildable: False
+    main-is:           SnowdriftEmailDaemon.hs
+    build-depends:     base
+                     , async
+                     , attoparsec
+                     , authenticate
+                     , blaze-builder
+                     , blaze-html
+                     , blaze-markup
+                     , bytestring
+                     , containers
+                     , cmdargs
+                     , data-default
+                     , Diff
+                     , esqueleto
+                     , email-validate
+                     , fast-logger
+                     , github
+                     , hjsmin
+                     , http-conduit
+                     , lifted-base
+                     , mime-mail
+                     , monad-logger
+                     , mtl
+                     , path-pieces
+                     , persistent
+                     , persistent-postgresql
+                     , persistent-template
+                     , random
+                     , resourcet
+                     , semigroups
+                     , shakespeare
+                     , stm
+                     , template-haskell
+                     , text
+                     , time
+                     , transformers
+                     , yaml
+                     , yesod
+                     , yesod-auth
+                     , yesod-auth-hashdb
+                     , yesod-core
+                     , yesod-form
+                     , yesod-markdown
+                     , yesod-static
+
+    extensions: BangPatterns
+                ConstraintKinds
+                DeriveDataTypeable
+                EmptyDataDecls
+                ExistentialQuantification
+                FlexibleContexts
+                FlexibleInstances
+                GeneralizedNewtypeDeriving
+                LambdaCase
+                MultiParamTypeClasses
+                MultiWayIf
+                NoImplicitPrelude
+                QuasiQuotes
+                OverloadedStrings
+                RankNTypes
+                RecordWildCards
+                ScopedTypeVariables
+                TemplateHaskell
+                TupleSections
+                TypeFamilies
+
+executable         sdm
+    if flag(dev)
+       ghc-options: -Wall
+    if flag(library-only)
+        Buildable: False
+
+    main-is:           Sdm.hs
+    hs-source-dirs:    dev
+    build-depends:     base
+                     , bytestring
+                     , cmdargs
+                     , directory
+                     , mwc-random
+                     , process
+                     , semigroups
 
 test-suite test
     type:              exitcode-stdio-1.0
     main-is:           main.hs
     hs-source-dirs:    tests
     ghc-options:       -Wall
+
+    extensions: QuasiQuotes
 
     build-depends: base
                  , Snowdrift
@@ -241,6 +377,7 @@ test-suite test
                  , persistent-postgresql
                  , resourcet
                  , monad-logger
+                 , monad-control
                  , transformers
                  , bytestring
                  , text
@@ -248,6 +385,7 @@ test-suite test
                  , network
                  , http-types
                  , wai-test
+                 , wai-extra
                  , unix
                  , mtl
                  , containers
@@ -255,3 +393,7 @@ test-suite test
                  , xml-conduit
                  , esqueleto
                  , HUnit
+                 , template-haskell
+                 , haskell-src-exts
+                 , haskell-src-meta
+                 , lifted-base

@@ -1,74 +1,73 @@
-{-# LANGUAGE FlexibleInstances #-}
-
 module Foundation where
 
-import Prelude
-import Yesod hiding ((==.), count, Value)
-import Yesod.Static
-import Yesod.Auth
-import Yesod.Auth.BrowserId
-import Yesod.Auth.HashDB (authHashDB, setPassword)
-
-import Yesod.Default.Config
-import Yesod.Default.Util (addStaticContentExternal)
-import Yesod.Core.Types (Logger)
-import Network.HTTP.Conduit (Manager)
+import           Model
+import           Model.Currency
+import           Model.Established.Internal         (Established(..))
+import           Model.Notification.Internal        (NotificationType(..), NotificationDelivery(..))
+import           Model.SnowdriftEvent.Internal
+import           Model.Language
 import qualified Settings
-import Settings.Development (development)
+import           Settings                           (widgetFile, Extra (..))
+import           Settings.Development               (development)
+import           Settings.StaticFiles
+
+import           Blaze.ByteString.Builder.Char.Utf8 (fromText)
+import           Control.Applicative
+import           Control.Concurrent.STM
+import           Control.Exception.Lifted           (throwIO, handle)
+import           Control.Monad
+import           Control.Monad.Logger
+import           Control.Monad.Reader
+import           Control.Monad.Trans.Resource
+import           Control.Monad.Writer.Strict        (WriterT, runWriterT)
+import qualified Data.ByteString.Lazy.Char8         as LB
+import           Data.Char                          (isSpace)
+import           Data.Int                           (Int64)
+import           Data.Maybe                         (fromJust, mapMaybe)
+import           Data.Monoid
+import           Data.Time
+import           Data.Text                          as T
+import qualified Data.Text.Lazy                     as TL
+import qualified Data.Text.Lazy.Encoding            as E
+import           Database.Esqueleto
 import qualified Database.Persist
-import Settings.StaticFiles
-import Settings (widgetFile, Extra (..))
-import Model
-import Text.Jasmine (minifym)
-import Text.Hamlet (hamletFile)
+import           Network.HTTP.Conduit               (Manager)
+import           Prelude
+import           Text.Blaze.Html.Renderer.Text      (renderHtml)
+import           Text.Hamlet                        (hamletFile)
+import           Text.Jasmine                       (minifym)
+import           Web.Authenticate.BrowserId         (browserIdJs)
+import           Yesod                              hiding (runDB, (==.), count, Value)
+import qualified Yesod                              as Y
+import           Yesod.Auth
+import           Yesod.Auth.BrowserId
+import           Yesod.Auth.HashDB                  (authHashDB, setPassword)
+import           Yesod.Core.Types                   (Logger)
+import           Yesod.Default.Config
+import           Yesod.Default.Util                 (addStaticContentExternal)
+import           Yesod.Form.Jquery
+import           Yesod.Markdown                     (Markdown (..))
+import           Yesod.Static
 
-import Model.Currency
-
-import Control.Applicative
-import Control.Monad.Trans.Resource
-import Control.Monad
-import Control.Exception.Lifted (throwIO, handle)
-
-import Data.Int (Int64)
-import Data.Text as T
-
-import Data.Char (isSpace)
-
-import Data.Maybe
-
-import Web.Authenticate.BrowserId (browserIdJs)
-
-import Blaze.ByteString.Builder.Char.Utf8 (fromText)
-
-import Yesod.Form.Jquery
-
-import Yesod.Markdown (Markdown (..))
-
-import qualified Data.ByteString.Lazy.Char8 as LB
-import qualified Data.Text.Lazy.Encoding as E
-
-import Data.Time
-
-import Database.Esqueleto
-
-import           Text.Blaze.Html.Renderer.Text (renderHtml)
-import qualified Data.Text.Lazy       as TL
-import Data.Monoid
+-- A type for running DB actions outside of a Handler.
+type Daemon a = ReaderT App (LoggingT (ResourceT IO)) a
 
 -- | The site argument for your application. This can be a good place to
 -- keep settings and values requiring initialization before your application
 -- starts running, such as database connections. Every handler will have
 -- access to the data present here.
 data App = App
-    { appNavbar :: WidgetT App IO ()
-    , settings :: AppConfig DefaultEnv Extra
-    , getStatic :: Static -- ^ Settings for static file serving.
-    , connPool :: Database.Persist.PersistConfigPool Settings.PersistConf -- ^ Database connection pool.
-    , httpManager :: Manager
-    , persistConfig :: Settings.PersistConf
-    , appLogger :: Logger
+    { appNavbar        :: WidgetT App IO ()
+    , settings         :: AppConfig DefaultEnv Extra
+    , getStatic        :: Static -- ^ Settings for static file serving.
+    , connPool         :: Database.Persist.PersistConfigPool Settings.PersistConf -- ^ Database connection pool.
+    , httpManager      :: Manager
+    , persistConfig    :: Settings.PersistConf
+    , appLogger        :: Logger
+    , appEventChan     :: TChan SnowdriftEvent
+    , appEventHandlers :: AppConfig DefaultEnv Extra
+                       -> [SnowdriftEvent -> Daemon ()]
     }
-
 
 plural :: Integral i => i -> Text -> Text -> Text
 plural 1 x _ = x
@@ -140,15 +139,9 @@ instance Yesod App where
         master <- getYesod
         mmsg <- getMessage
         malert <- getAlert
-        muser_id <- maybeAuthId
-        muser <- runDB $ case muser_id of
-            Nothing -> return Nothing
-            Just user_id -> get user_id
 
         let navbar = appNavbar master
-        let userPrintName :: Entity User -> Text
-            userPrintName (Entity user_id user) =
-                fromMaybe (either (error . T.unpack) (T.append "user") $ fromPersistValue $ unKey user_id) (userName user)
+
         -- We break up the default layout into two components:
         -- default-layout is the contents of the body tag, and
         -- default-layout-wrapper is the entire page. Since the final
@@ -156,7 +149,6 @@ instance Yesod App where
         -- you to use normal widget features in default-layout.
 
         pc <- widgetToPageContent $ do
-            $(widgetFile "normalize")
             addStylesheet $ StaticR css_bootstrap_min_css
             addScript $ StaticR js_bootstrap_min_js
             navbar
@@ -176,11 +168,11 @@ instance Yesod App where
     -- The page to be redirected to when authentication is required.
     authRoute _ = Just $ AuthR LoginR
 
-    errorHandler (PermissionDenied _) = do
+    errorHandler (PermissionDenied s) = do
         maybe_user <- maybeAuth
-        selectRep $ 
+        selectRep $
             provideRep $ defaultLayout $ do
-                setTitle "Permission Denied"
+                setTitle $ "Permission Denied: " <> toHtml s
                 toWidget [hamlet|$newline never
                     <h1>Permission Denied
                     <p>
@@ -232,17 +224,14 @@ instance Yesod App where
 instance YesodPersist App where
     type YesodPersistBackend App = SqlPersistT
     runDB = defaultRunDB persistConfig connPool
+
 instance YesodPersistRunner App where
     getDBRunner = defaultGetDBRunner connPool
 
 -- set which project in the site runs the site itself
 getSiteProject :: Handler (Entity Project)
-getSiteProject = do
-    handle <- getSiteProjectHandle
-    project <- runDB $ getBy $ UniqueProjectHandle handle
-    case project of
-         Nothing -> error "No project has been defined as the owner of this website."
-         Just a -> return a
+getSiteProject = maybe (error "No project has been defined as the owner of this website.") id <$>
+    (getSiteProjectHandle >>= runYDB . getBy . UniqueProjectHandle)
 
 getSiteProjectHandle :: Handler Text
 getSiteProjectHandle = extraSiteProject . appExtra . settings <$> getYesod
@@ -250,7 +239,7 @@ getSiteProjectHandle = extraSiteProject . appExtra . settings <$> getYesod
 authBrowserIdFixed :: AuthPlugin App
 authBrowserIdFixed =
     let complete = PluginR "browserid" []
-	login :: (Route Auth -> Route App) -> WidgetT App IO ()
+        login :: (Route Auth -> Route App) -> WidgetT App IO ()
         login toMaster = do
             addScriptRemote browserIdJs
 
@@ -294,9 +283,9 @@ snowdriftAuthBrowserId =
         login toMaster = do
             let parentLogin = apLogin auth toMaster
             [whamlet|
-                <p>
-                    <strong>Mozilla Persona is a secure log-in that doesn't track you! 
-                    ^{parentLogin}
+                <div .text-center>
+                    <strong>We support Mozilla Persona &mdash; a universal, secure log-in that doesn't track you!
+                ^{parentLogin}
                 <p>
                     The Persona sign-in button works for both new and existing accounts.
             |]
@@ -309,15 +298,16 @@ snowdriftAuthHashDB =
         login toMaster =
             [whamlet|
                 <div id="login">
-                    <p .h3 .text-center> We also offer a built-in system
+                    <div .text-center>
+                        <strong>We also offer a built-in system
                         <br>
-                        <small>
-                            <a href="@{UserCreateR}">
-                                click here to create a new account
+                        <a href="@{UserCreateR}">
+                            <button>click here to create a new account
+                        <p> or log-in below:
                     <form .form-horizontal method="post" action="@{toMaster loginRoute}">
                         <div .form-group>
                             <label .col-sm-4 .control-label>
-                                Username:
+                                Handle:
                             <div .col-sm-8>
                                 <input .form-control id="x" name="username" autofocus="" required>
                         <div .form-group>
@@ -325,8 +315,11 @@ snowdriftAuthHashDB =
                                 Passphrase:
                             <div .col-sm-8>
                                 <input .form-control type="password" name="password" required>
-                        <figure>
-                            <input type="submit" value="Log in">
+                        <div .form-group>
+                            <div .col-sm-offset-4 .col-sm-8>
+                                <input type="submit" value="Log in">
+                                <a href="@{ResetPasswordR}" .text-nowrap>
+                                    forgot your password?
             |]
      in auth { apLogin = login }
 
@@ -342,7 +335,7 @@ instance YesodAuth App where
         maybe_user_id <- runDB $ getBy $ UniqueUser $ credsIdent creds
         case maybe_user_id of
             Just (Entity user_id _) -> return $ Just user_id
-            Nothing -> createUser (credsIdent creds) Nothing Nothing Nothing Nothing
+            Nothing -> createUser (credsIdent creds) Nothing Nothing Nothing Nothing Nothing
 
     -- You can add other plugins like BrowserID, email or OAuth here
     authPlugins _ = [ snowdriftAuthBrowserId, snowdriftAuthHashDB ]
@@ -356,17 +349,20 @@ instance YesodAuth App where
         lift $ defaultLayout $(widgetFile "auth")
 
 
-createUser :: Text -> Maybe Text -> Maybe Text -> Maybe Text -> Maybe Text -> Handler (Maybe UserId)
-createUser ident passwd name avatar nick = do
+createUser :: Text -> Maybe Text -> Maybe Text -> Maybe Text -> Maybe Text
+           -> Maybe Text -> Handler (Maybe UserId)
+createUser ident passwd name email avatar nick = do
+    langs <- mapMaybe (readMaybe . T.unpack) <$> languages
     now <- liftIO getCurrentTime
-    handle (\ DBException -> return Nothing) $ runDB $ do
-        account_id <- insert $ Account 0
-        user <- maybe return setPassword passwd $ User ident (Just now) Nothing Nothing name account_id avatar Nothing Nothing nick now now now now Nothing Nothing
+    handle (\DBException -> return Nothing) $ runYDB $ do
+        account_id <- insert (Account 0)
+        discussion_id <- insert (Discussion 0)
+        user <- maybe return setPassword passwd $ User ident email False (Just now) Nothing Nothing name account_id avatar Nothing Nothing nick langs now now EstUnestablished discussion_id
         uid_maybe <- insertUnique user
         Entity snowdrift_id _ <- getBy404 $ UniqueProjectHandle "snowdrift"
         case uid_maybe of
             Just user_id -> do
-    
+
                 -- TODO refactor back to insertSelect when quoting issue is resolved
                 --
                 -- insertSelect $ from $ \ p -> return $ TagColor <# (p ^. DefaultTagColorTag) <&> val user_id <&> (p ^. DefaultTagColorColor)
@@ -375,17 +371,37 @@ createUser ident passwd name avatar nick = do
                 forM_ default_tag_colors $ \ (Entity _ (DefaultTagColor tag color)) -> insert $ TagColor tag user_id color
                 --
 
-                let message_text = Markdown $ T.unlines
+                insertDefaultNotificationPrefs user_id
+
+                let notif_text = Markdown $ T.unlines
                         [ "Thanks for registering!"
                         , "<br> Please read our [**welcome message**](/p/snowdrift/w/welcome), and let us know any questions."
                         ]
                 -- TODO: change snowdrift_id to the generated site-project id
-                void $ insert $ Message (Just snowdrift_id) now Nothing (Just user_id) message_text True
+                -- TODO(mitchell): This notification doesn't get sent to the event channel. Is that okay?
+                insert_ $ Notification now NotifWelcome user_id (Just snowdrift_id) notif_text False
                 return $ Just user_id
             Nothing -> do
-                lift $ addAlert "danger" "E-mail or handle already in use."
+                lift $ addAlert "danger" "Handle already in use."
                 throwIO DBException
-
+  where
+    insertDefaultNotificationPrefs :: UserId -> DB ()
+    insertDefaultNotificationPrefs user_id =
+        void . insertMany $ uncurry (UserNotificationPref user_id) <$>
+            -- 'NotifWelcome' is not set since it is delivered when a
+            -- user is created.
+            [ (NotifEligEstablish,     NotifDeliverWebsite)
+            , (NotifEligEstablish,     NotifDeliverEmail)
+            , (NotifBalanceLow,        NotifDeliverWebsite)
+            , (NotifBalanceLow,        NotifDeliverEmail)
+            , (NotifUnapprovedComment, NotifDeliverEmail)
+            , (NotifRethreadedComment, NotifDeliverWebsite)
+            , (NotifReply,             NotifDeliverEmail)
+            , (NotifEditConflict,      NotifDeliverWebsite)
+            , (NotifFlag,              NotifDeliverWebsite)
+            , (NotifFlag,              NotifDeliverEmail)
+            , (NotifFlagRepost,        NotifDeliverWebsite)
+            ]
 
 instance YesodJquery App
 
@@ -424,10 +440,11 @@ addAlertEm level msg em = do
             #{msg}
     |] render
 
+-- TODO(mitchell): don't export this
 addAlert :: Text -> Text -> Handler ()
 addAlert level msg = do
     render <- getUrlRenderParams
-    prev <- lookupSession alertKey
+    prev   <- lookupSession alertKey
 
     setSession alertKey $ maybe id mappend prev $ TL.toStrict $ renderHtml $ [hamlet|
         $newline never
@@ -435,9 +452,83 @@ addAlert level msg = do
             #{msg}
     |] render
 
+alertDanger, alertInfo, alertSuccess, alertWarning :: Text -> Handler ()
+alertDanger  = addAlert "danger"
+alertInfo    = addAlert "info"
+alertSuccess = addAlert "success"
+alertWarning = addAlert "warning"
+
 getAlert :: Handler (Maybe Html)
 getAlert = do
     mmsg <- liftM (fmap preEscapedToMarkup) $ lookupSession alertKey
     deleteSession alertKey
     return mmsg
+
+-- | Get the ProjectId for the "snowdrift" project. Partial function. Possibly this should
+-- be replaced by a hard-coded key? We're hard-coding "snowdrift", anyways.
+getSnowdriftId :: DB ProjectId
+getSnowdriftId = entityKey . fromJust <$> getBy (UniqueProjectHandle "snowdrift")
+
+-- | Write a list of SnowdriftEvent to the event channel.
+pushEvents :: (MonadIO m, MonadReader App m) => [SnowdriftEvent] -> m ()
+pushEvents events = ask >>= liftIO . atomically . forM_ events . writeTChan . appEventChan
+
+--------------------------------------------------------------------------------
+
+-- There are FOUR different kinds of database actions, each with a different run function.
+-- Terminology:
+--    DB - database
+--    Y  - Yesod
+--    S  - Snowdrift
+
+-- Convenient type synonym for all that is required to hit the database in a monad.
+-- Types that satisfy this constraint: Handler, Daemon.
+type DBConstraint m = (MonadBaseControl IO m, MonadIO m, MonadLogger m, MonadResource m, MonadReader App m)
+
+-- Run a Daemon in IO.
+runDaemon :: App -> Daemon a -> IO a
+runDaemon app daemon =
+    runResourceT $
+      runLoggingT
+        (runReaderT daemon app)
+        (messageLoggerSource app (appLogger app))
+
+-- A basic database action.
+type DB a = DBConstraint m => SqlPersistT m a
+
+runDB :: DBConstraint m => DB a -> m a
+runDB action = do
+    app <- ask
+    Database.Persist.runPool (persistConfig app) action (connPool app)
+
+-- A database action that requires the inner monad to be Handler (for example, to use
+-- get404 or getBy404)
+type YDB a = SqlPersistT Handler a
+
+runYDB :: YDB a -> Handler a
+runYDB = Y.runDB
+
+-- A database action that writes [SnowdriftEvent], to be run after the transaction is complete.
+type SDB a  = DBConstraint m => WriterT [SnowdriftEvent] (SqlPersistT m) a
+
+runSDB :: DBConstraint m => SDB a -> m a
+runSDB w = do
+    (a, events) <- runDB (runWriterT w)
+    pushEvents events
+    return a
+
+-- A combination of YDB and SDB (writes events, requires inner Handler).
+type SYDB a = WriterT [SnowdriftEvent] (SqlPersistT Handler) a
+
+runSYDB :: SYDB a -> Handler a
+runSYDB w = do
+    (a, events) <- runYDB (runWriterT w)
+    pushEvents events
+    return a
+
+-- from http://stackoverflow.com/questions/8066850/why-doesnt-haskells-prelude-read-return-a-maybe
+readMaybe   :: (Read a) => String -> Maybe a
+readMaybe s = case [x | (x,t) <- reads s, ("","") <- lex t] of
+                  [x] -> Just x
+                  _   -> Nothing
 

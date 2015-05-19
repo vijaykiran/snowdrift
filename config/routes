@@ -202,3 +202,8 @@
 
 /p/#Text/w/#Language/#Text/comment/#CommentId  OldDiscussCommentR GET
 /p/#Text/w/#Language/#Text/history/#WikiEditId OldWikiEditR       GET
+
+
+-- API
+
+/api ApiRootR GET

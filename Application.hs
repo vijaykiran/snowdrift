@@ -42,6 +42,7 @@ import           Yesod.Default.Main hiding (LogFunc)
 -- Import all relevant handler modules here.
 -- Don't forget to add new modules to your cabal file!
 
+import Api.Root
 import Handler.BuildFeed
 import Handler.Comment
 import Handler.Home

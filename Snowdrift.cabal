@@ -25,6 +25,7 @@ Flag library-only
 
 library
     exposed-modules: 
+      Api.Root
       Application
       Data.Filter                                   
       Data.Order                                    

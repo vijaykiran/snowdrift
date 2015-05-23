@@ -11,7 +11,12 @@ I'll just link to those sequentially.
     setting up a user, and everything thereafter.
 3.  Run these commands:
 
-        git clone https://git.gnu.io/snowdrift/snowdrift.git
+        git clone https://github.com/pharpend/snowdrift.git
+
+    **Important**: as of 2015-05-23, the mainline Snowdrift repository
+    doesn't support the newest version of GHC, which Arch has in its
+    official repositories. So, you have to use `pharpend`'s branch.
+
         cd snowdrift
         ln -s cabal.config.7.10 cabal.config
         cabal sandbox init

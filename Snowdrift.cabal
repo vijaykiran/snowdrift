@@ -168,6 +168,7 @@ library
                 ViewPatterns
 
     build-depends: base                          >= 4          && < 5
+                 , aeson
                  , async
                  , attoparsec
                  , authenticate
@@ -175,13 +176,16 @@ library
                  , blaze-html
                  , blaze-markup
                  , bytestring
-                 , conduit
+                 , conduit >=1.2.3
+                 , conduit-extra >=1.1
+                 , conduit-combinators
                  , containers
                  , data-default
                  , Diff
                  , directory
                  , esqueleto
                  , fast-logger
+                 , file-embed
                  , github >=0.13.2
                  , hit
                  , hjsmin
@@ -189,6 +193,7 @@ library
                  , http-conduit
                  , http-types
                  , lifted-base
+                 , markdown
                  , mime-mail
                  , monad-logger
                  , mtl

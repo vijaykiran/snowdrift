@@ -1,13 +1,14 @@
 # Snowdrift setup instructions for Arch Linux
 
-Arch has the benefit of being very well-documented, so this document is
-very short!
+The Arch Wiki already has documentation on the individual components, so
+I'll just link to those sequentially.
 
-1.  [Install Haskell][1]. While you are at it, make sure you have the
-    `base-devel` group installed.
-2.  [Install PostgreSQL][2]. You don't need to go through setting up a
-    user or anything like that. Snowdrift will do that for you.
-3.  Run these commands:
+1.  [Install Haskell][1].
+2.  `pacman -S base-devel`
+3.  [Install PostgreSQL][2]. You only need to go through the
+    "installing" step. We have a script, `sdm`, that will take care of
+    setting up a user, and everything thereafter.
+4.  Run these commands:
 
         git clone https://git.gnu.io/snowdrift/snowdrift.git
         cd snowdrift

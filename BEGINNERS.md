@@ -54,9 +54,11 @@ follow the [Vagrant setup instructions](SETUP_VAGRANT.md).
 **This is the best and easiest option for all systems including
 GNU/Linux, BSD, Mac OS X, and Windows.**
 
-As an alternative option, we also have instructions for local installation.
-[Debian-based instructions](SETUP_DEBIAN.md) work for Debian or Ubuntu or
-related, and our general [GUIDE](GUIDE.md) has some notes for other systems.
+As an alternative option, we also have instructions for local
+installation.  [Debian-based instructions](SETUP_DEBIAN.md) work for
+Debian or Ubuntu or related, [Arch Linux instructions](SETUP_ARCH.md)
+for Arch Linux, and our general [GUIDE](GUIDE.md) has some notes for
+other systems.
 
 ## Working on the code
 

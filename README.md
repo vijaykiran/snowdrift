@@ -59,7 +59,7 @@ The easiest way to build the site is to use a virtual machine via our
 Vagrant works for nearly all operating systems.
 
 If you prefer to install locally, see our
-[Debian/Ubuntu setup instructions](SETUP_DEBIAN.md)
-or the [GUIDE.md](GUIDE.md) file for other systems
-(including other GNU/Linux distros and Mac OS X).
-The GUIDE also includes further technical notes.
+[Debian/Ubuntu setup instructions](SETUP_DEBIAN.md), our
+[Arch Linux install instructions](SETUP_ARCH.md), or the
+[GUIDE.md](GUIDE.md) file for other systems (including other GNU/Linux
+distros and Mac OS X).  The GUIDE also includes further technical notes.

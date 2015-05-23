@@ -36,12 +36,15 @@ not an absolute path.
 
 `yesod devel` will stay running in one terminal while you do work
 elsewhere. It will rebuild the site whenever you change certain
-files. Often times, it won't detect changes. In which case, stop `yesod
-devel` by hitting `Return` a few times, then start it up again.
+files. Sometimes, it won't detect changes. In which case, stop `yesod
+devel` by hitting `Enter` a few times, then:
 
-If that doesn't work, try killing `yesod devel`, then
+    cabal clean && yesod devel
 
-    cabal clean && cabal install -fdev --enable-tests && yesod devel
+If you add new dependencies (i.e. edited the `build-depends` field in
+`Snowdrift.cabal`), then run
+
+    cabal install -fdev
 
 ## More resources
 

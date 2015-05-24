@@ -2,47 +2,52 @@
 
 ## Installing stuff
 
-The Arch Wiki already has documentation on the individual components, so
-I'll just link to those sequentially.
+The Arch Wiki has documentation on the main dependent components:
 
-1.  [Install Haskell][1].
-2.  [Install PostgreSQL][2]. You only need to go through the
+*.  [Install Haskell][1], including the Haskell development tools
+    and setting $PATH.
+*.  [Install PostgreSQL][2]. You only need to go through the
     "installing" step. We have a script, `sdm`, that will take care of
     setting up a user, and everything thereafter.
-3.  Run these commands:
 
-        git clone https://github.com/pharpend/snowdrift.git
+With that done, clone the Snowdrift code:
 
-    **Important**: as of 2015-05-23, the mainline Snowdrift repository
-    doesn't support the newest version of GHC, which Arch has in its
-    official repositories. So, you have to use `pharpend`'s branch.
+**Important**: as of 2015-05-23, the mainline Snowdrift repository
+doesn't support the newest version of GHC, which Arch has in its
+official repositories. So, you have to use `pharpend`'s branch.
 
-        cd snowdrift
-        ln -s cabal.config.7.10 cabal.config
-        cabal sandbox init
-        cabal install -fdev
-        sdm init
-        cabal install -fdev --enable-tests
-        yesod devel
+    git clone https://github.com/pharpend/snowdrift.git
+
+Install and run Snowdrift:
+
+    cd snowdrift
+    cabal install yesod-bin
+    ln -s cabal.config.7.10 cabal.config
+    cabal sandbox init
+    cabal install -fdev
+    sdm init
+    cabal install -fdev --enable-tests
+    yesod devel
 
 The site should now be running on <http://localhost:3000>.
 
-If you get an error "command not found: sdm", or "command not found:
-yesod", when you try to run those respective commands, make sure that
-`.cabal-sandbox/bin` is in your path. Note that this is a relative path,
-not an absolute path.
+Now you can play with Snowdrift locally.
+To log into the site, use the built-in system with
+user: `admin` pass: `admin`
 
 ## Workflow
 
-`yesod devel` will stay running in one terminal while you do work
-elsewhere. It will rebuild the site whenever you change certain
-files. Sometimes, it won't detect changes. In which case, stop `yesod
-devel` by hitting `Enter` a few times, then:
+Once going, `yesod devel` can stay running in one terminal while
+you do work elsewhere.
+It will rebuild and rerun the site whenever it detects file changes.
+
+In cases where `yesod devel` fails to detect changes,
+stop it with the Enter key, then run:
 
     cabal clean && yesod devel
 
-If you add new dependencies (i.e. edited the `build-depends` field in
-`Snowdrift.cabal`), then run
+If you add new dependencies (i.e. edit the `build-depends` field in
+`Snowdrift.cabal`), you will need to run:
 
     cabal install -fdev
 

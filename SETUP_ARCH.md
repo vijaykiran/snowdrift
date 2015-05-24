@@ -4,11 +4,12 @@
 
 The Arch Wiki has documentation on the main dependent components:
 
-*.  [Install Haskell][1], including the Haskell development tools
-    and setting $PATH.
-*.  [Install PostgreSQL][2]. You only need to go through the
-    "installing" step. We have a script, `sdm`, that will take care of
-    setting up a user, and everything thereafter.
+* [Install Haskell][1], including the Haskell development tools
+  and setting $PATH.
+
+* [Install PostgreSQL][2]. You only need to go through the
+  "installing" step. We have a script, `sdm`, that will take care of
+  setting up a user, and everything thereafter.
 
 With that done, clone the Snowdrift code:
 

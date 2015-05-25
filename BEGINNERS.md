@@ -51,8 +51,8 @@ If you are on a system that does not package git yet, you may choose to
 
 To get a quick virtual machine with the core dependencies for snowdrift,
 follow the [Vagrant setup instructions](SETUP_VAGRANT.md).
-**This is the best and easiest option for all systems including
-GNU/Linux, BSD, Mac OS X, and Windows.**
+**This is the easiest option for all systems including
+GNU/Linux, BSD, OS X, and Windows.**
 
 As an alternative option, we also have instructions for local installation.
 [Debian-based instructions](SETUP_DEBIAN.md) work for
@@ -174,7 +174,7 @@ Refresh your browser view at localhost:3000 to see the updates.
 In rare cases, you may need to run `cabal clean` if yesod devel
 fails to recognize a change.
 
-To stop yesod devel, press ENTER a few times.
+To stop yesod devel, press the Enter key.
 
 ### Testing changes
 

@@ -54,7 +54,9 @@ Beginners with minimal technical background should follow our
 making basic contributions.
 It also includes links and info to help learn more about the tools we use.
 
-The easiest way to build the site is to use a virtual machine via our
+### Install options
+
+An easy way to build the site is to use a virtual machine via our
 [Vagrant setup](SETUP_VAGRANT.md).
 Vagrant works for nearly all operating systems.
 

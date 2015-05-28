@@ -46,7 +46,7 @@ import Yesod.Markdown              (Markdown)
 -- at:
 -- http://www.yesodweb.com/book/persistent/
 share [ mkPersist sqlSettings
-      , mkMigrate "migrateAll"
+      -- , mkMigrate "migrateAll"
       , mkDeleteCascade sqlSettings
       , mkDiscussionTypes
       , mkReferences "Comment"

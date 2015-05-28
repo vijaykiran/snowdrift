@@ -168,9 +168,12 @@ makeFoundation conf = do
                         liftIO $ putStrLn "ready."
         _ -> return ()
 
-    let migration = runSqlPool
-            (doManualMigration >> runMigration migrateAll >> migrateTriggers)
-            pool
+    let migration = 
+          flip runSqlPool
+               pool
+               (do doManualMigration 
+                   -- runMigration migrateAll 
+                   migrateTriggers)
 
     void $ runLoggingT
         migration
@@ -244,7 +247,7 @@ deprecatedApplyManualMigrations = do
 -- storing the necessary sql statements to commit and share.
 saveUnsafeMigrations :: (MonadIO m, Functor m) => ReaderT SqlBackend m ()
 saveUnsafeMigrations = do
-    unsafe <- (L.filter fst) <$> parseMigration' migrateAll
+    unsafe <- pure mempty
     unless (L.null $ L.map snd unsafe) $ do
         liftIO $ T.writeFile filename $ T.unlines $ L.map ((`snoc` ';') . snd) unsafe
         liftIO $ mapM_ (T.hPutStrLn stderr) unsafeMigMessages
